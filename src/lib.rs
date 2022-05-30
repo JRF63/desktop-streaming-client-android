@@ -1,39 +1,36 @@
-use std::fmt::format;
+mod decoder;
+mod log;
+mod media_format;
 
-use ndk::{
-    asset::{Asset, AssetManager},
-    native_activity::NativeActivity,
-};
+mod debug;
+
+use ndk_sys::ANativeActivity;
 
 // adb logcat -s client-android
 // adb install target\debug\apk\client-android.apk
+// C:\Users\Rafael\AppData\Local\Android\Sdk\emulator\emulator -avd Pixel_3_API_31
 
-fn get_h264_packets(asset_manager: &AssetManager) -> Result<Vec<Asset>, Box<dyn std::error::Error>> {
-    use std::ffi::CString;
-    use std::io::Read;
-    use std::ptr::NonNull;
+#[no_mangle]
+unsafe extern "C" fn ANativeActivity_onCreate(
+    activity: *mut ANativeActivity,
+    _saved_state: *mut u8,
+    _saved_state_size: usize,
+) {
+    // need to set the ANativeActivity callbacks, particularly for ANativeWindow
+    info!("starting1");
 
-    let packets = (0..120)
-        .map(|i| {
-            let filename = CString::new(format!("{}.h264", i)).unwrap();
-            asset_manager.open(&filename).unwrap()
-        })
-        .collect::<Vec<Asset>>();
+    // if let Ok(csd) = debug::get_csd((&*activity).assetManager) {
+    //     info!("{}", csd.len());
+    // } else {
+    //     error!("`get_csd` failed");
+    // }
 
-    Ok(packets)
-}
+    match debug::get_csd((&*activity).assetManager) {
+        Ok(csd) => {
+            media_format::media_format_from_sample(&csd);
+        }
+        Err(e) => error!("{}", e),
+    }
 
-#[cfg_attr(
-    target_os = "android",
-    ndk_glue::main(logger(level = "debug", tag = "client-android"))
-)]
-fn main() {
-    // TODO: Probably don't use ndk_glue and ndk_context
-    #[allow(deprecated)]
-    let native_activity = ndk_glue::native_activity();
-
-    let asset_manager = native_activity.asset_manager();
-    let packets = get_h264_packets(&asset_manager).unwrap();
-    log::info!("packets: {}", packets.len());
-    // native_activity.finish();
+    info!("exiting");
 }

@@ -7,16 +7,14 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-jni = "0.19"
-libc = "0.2"
-log = "0.4.14"
-ndk = { version = "0.6" }
-ndk-context = "0.1"
-ndk-glue = { version = "0.6", features = ["logger"] }
+ndk-sys = { version = "0.3", features = ["media"] }
+anyhow = "1.0"
+crossbeam-channel = "0.5"
 
 [package.metadata.android]
 package = "com.foo.bar"
 build_targets = [ "x86_64-linux-android" ]
+# build_targets = [ "aarch64-linux-android" ]
 assets = "assets"
 
 [package.metadata.android.sdk]
