@@ -1,101 +1,10 @@
 use ndk_sys::{
-    AMediaFormat, AMediaFormat_delete, AMediaFormat_new, AMediaFormat_setInt32,
-    AMediaFormat_setString, AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT,
-    AMEDIAFORMAT_KEY_MIME, AMEDIAFORMAT_KEY_WIDTH,
+    AMediaFormat, AMediaFormat_delete, AMediaFormat_getString, AMediaFormat_new,
+    AMediaFormat_setBuffer, AMediaFormat_setInt32, AMediaFormat_setString,
+    AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_MIME,
+    AMEDIAFORMAT_KEY_WIDTH,
 };
 use std::ptr::NonNull;
-
-pub fn media_format_from_sample(sample: &[u8]) {
-    use crate::{info, error};
-    use ndk_sys::{AMediaExtractor_delete, AMediaExtractor_new, AMediaExtractor_setDataSourceCustom, AMediaExtractor_getTrackFormat};
-    use ndk_sys::{AMediaDataSource_new, AMediaDataSource_close,
-         AMediaDataSource_setReadAt,
-         AMediaDataSource_setGetSize,
-         AMediaDataSource_setUserdata,
-         AMediaDataSource_setClose,
-    };
-
-    use std::ffi::c_void;
-    use std::io::{Cursor, SeekFrom};
-    use std::io::prelude::*;
-
-    let mut cursor = Cursor::new(sample);
-
-    unsafe extern "C" fn read_at(userdata: *mut c_void, offset: i64, buffer: *mut c_void, size: u64) -> i64 {
-        let cursor: &mut Cursor<&[u8]> = &mut *userdata.cast();
-        if cursor.get_ref().len() <= offset as usize {
-            info!("hardcoded return");
-            return -1;
-        }
-        if let Ok(_) = cursor.seek(SeekFrom::Start(offset as _)) {
-            let dest = std::slice::from_raw_parts_mut(buffer as *mut u8, size as usize);
-            if let Ok(bytes) = cursor.read(dest) {
-                if bytes != 0 {
-                    info!("read_at: {}, size: {}, result: {}", offset, size, bytes);
-                    return bytes as i64;
-                }
-                info!("read_at: {}, size: {}, result: {}", offset, size, bytes);
-                return bytes as i64;
-            }
-            // let _ = cursor.rewind();
-            info!("read_at: {}, size: {}, result: {}", offset, size, 0);
-            0
-        } else {
-            info!("Seek end - read_at: {}, size: {}, result: {}", offset, size, 0);
-            0
-        }
-    }
-
-    unsafe extern "C" fn get_size(userdata: *mut c_void) -> i64 {
-        info!("get_size");
-        let cursor: &mut Cursor<&[u8]> = &mut *userdata.cast();
-        cursor.get_ref().len() as i64
-    }
-
-    unsafe extern "C" fn close(_userdata: *mut c_void) {
-
-    }
-
-    unsafe {
-        let data_source = AMediaDataSource_new();
-        AMediaDataSource_setUserdata(data_source, (&mut cursor as *mut Cursor<&[u8]>) as *mut c_void);
-        AMediaDataSource_setReadAt(data_source, Some(read_at));
-        AMediaDataSource_setGetSize(data_source, Some(get_size));
-        AMediaDataSource_setClose(data_source, Some(close));
-
-        let media_extractor = AMediaExtractor_new();
-        if media_extractor.is_null() {
-            error!("`AMediaExtractor_new` failed");
-            return;
-        }
-
-        AMediaExtractor_setDataSourceCustom(media_extractor, data_source);
-
-        let media_format = AMediaExtractor_getTrackFormat(media_extractor, 0);
-        if media_format.is_null() {
-            error!("`AMediaExtractor_getTrackFormat` failed");
-        } else {
-            info!("`AMediaExtractor_getTrackFormat` returned something");
-            use ndk_sys::{AMediaFormat_getInt32};
-            use std::ffi::CStr;
-
-            let mut height = 0;
-            let mut width = 0;
-            AMediaFormat_getInt32(media_format, AMEDIAFORMAT_KEY_HEIGHT, &mut height);
-            AMediaFormat_getInt32(media_format, AMEDIAFORMAT_KEY_WIDTH, &mut width);
-
-            info!("{} {}", height, width);
-
-            // let mut mime_type: *const i8 = std::ptr::null_mut();
-            // AMediaFormat_getString(media_format, AMEDIAFORMAT_KEY_MIME, &mut mime_type);
-            // let cstr = CStr::from_ptr(mime_type);
-            // info!("mime: {}", cstr.to_string_lossy());
-            // AMediaFormat_delete(media_format);
-        }
-        AMediaExtractor_delete(media_extractor);
-        AMediaDataSource_close(data_source);
-    }
-}
 
 #[repr(transparent)]
 pub(crate) struct MediaFormat(NonNull<AMediaFormat>);
@@ -114,32 +23,110 @@ impl MediaFormat {
         width: i32,
         height: i32,
         frame_rate: i32,
+        csd: &[u8],
     ) -> anyhow::Result<Self> {
         unsafe {
             if let Some(media_format) = NonNull::new(AMediaFormat_new()) {
-                AMediaFormat_setString(
-                    media_format.as_ptr(),
-                    AMEDIAFORMAT_KEY_MIME,
-                    video_type.as_cstr_ptr(),
-                );
-                AMediaFormat_setInt32(media_format.as_ptr(), AMEDIAFORMAT_KEY_HEIGHT, height);
-                AMediaFormat_setInt32(media_format.as_ptr(), AMEDIAFORMAT_KEY_WIDTH, width);
-                AMediaFormat_setInt32(
-                    media_format.as_ptr(),
-                    AMEDIAFORMAT_KEY_FRAME_RATE,
-                    frame_rate,
-                );
-                Ok(MediaFormat(media_format))
+                let mut media_format = MediaFormat(media_format);
+
+                media_format.set_video_type(video_type);
+                media_format.set_width(width);
+                media_format.set_height(height);
+                media_format.set_frame_rate(frame_rate);
+
+                match video_type {
+                    VideoType::H264 => {
+                        let boundaries = nal_boundaries(csd);
+
+                        if boundaries.len() == 2 {
+                            if let (Some(first), Some(second)) = (
+                                csd.get(boundaries[0]..boundaries[1]),
+                                csd.get(boundaries[1]..),
+                            ) {
+                                if let (Some(csd0), Some(csd1)) = (
+                                    H264Csd::get_nal_unit_type(first),
+                                    H264Csd::get_nal_unit_type(second),
+                                ) {
+                                    if csd0 != csd1 {
+                                        media_format.set_h264_csd(csd0, first);
+                                        media_format.set_h264_csd(csd1, second);
+                                        crate::info!("SUccess");
+                                        return Ok(media_format);
+                                    }
+                                }
+                            }
+                        }
+
+                        anyhow::bail!("Invalid SPS/PPS data")
+                    }
+                    VideoType::Hevc => todo!(),
+                }
             } else {
                 anyhow::bail!("AMediaFormat_new returned a null");
             }
         }
     }
+
+    pub(crate) fn as_inner(&self) -> *mut AMediaFormat {
+        self.0.as_ptr()
+    }
+
+    fn set_video_type(&mut self, video_type: VideoType) {
+        unsafe {
+            AMediaFormat_setString(
+                self.as_inner(),
+                AMEDIAFORMAT_KEY_MIME,
+                video_type.as_cstr_ptr(),
+            );
+        }
+    }
+
+    fn set_width(&mut self, width: i32) {
+        unsafe {
+            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_WIDTH, width);
+        }
+    }
+
+    fn set_height(&mut self, height: i32) {
+        unsafe {
+            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_HEIGHT, height);
+        }
+    }
+
+    fn set_frame_rate(&mut self, frame_rate: i32) {
+        unsafe {
+            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_FRAME_RATE, frame_rate);
+        }
+    }
+
+    fn set_h264_csd(&mut self, csd: H264Csd, data: &[u8]) {
+        let name = match csd {
+            H264Csd::SPS => "csd-0\0",
+            H264Csd::PPS => "csd-1\0",
+        };
+        unsafe {
+            AMediaFormat_setBuffer(
+                self.as_inner(),
+                name.as_ptr().cast(),
+                data.as_ptr().cast(),
+                data.len() as u64,
+            );
+        }
+    }
+
+    pub(crate) fn get_mime_type(&self) -> *const i8 {
+        unsafe {
+            let mut cstr: *const i8 = std::ptr::null();
+            AMediaFormat_getString(self.as_inner(), AMEDIAFORMAT_KEY_MIME, &mut cstr);
+            cstr
+        }
+    }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum VideoType {
     H264,
-    HEVC,
+    Hevc,
 }
 
 impl VideoType {
@@ -150,7 +137,47 @@ impl VideoType {
     fn mime_cstr(&self) -> &'static str {
         match self {
             VideoType::H264 => "video/avc\0",
-            VideoType::HEVC => "video/hevc\0",
+            VideoType::Hevc => "video/hevc\0",
+        }
+    }
+}
+
+fn nal_boundaries(data: &[u8]) -> Vec<usize> {
+    let mut boundaries = Vec::with_capacity(3);
+
+    let mut zeroes = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        match byte {
+            0 => zeroes += 1,
+            1 => {
+                if zeroes == 3 {
+                    boundaries.push(i - 3);
+                }
+                zeroes = 0;
+            }
+            _ => zeroes = 0,
+        }
+    }
+    boundaries
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum H264Csd {
+    SPS = 7,
+    PPS = 8,
+}
+
+impl H264Csd {
+    const SPS_NAL_UNIT_TYPE: u8 = 7;
+    const PPS_NAL_UNIT_TYPE: u8 = 8;
+    const NAL_UNIT_TYPE_MASK: u8 = 0b11111;
+
+    fn get_nal_unit_type(data: &[u8]) -> Option<H264Csd> {
+        let v = data.get(4)?;
+        match v & H264Csd::NAL_UNIT_TYPE_MASK {
+            H264Csd::SPS_NAL_UNIT_TYPE => Some(H264Csd::SPS),
+            H264Csd::PPS_NAL_UNIT_TYPE => Some(H264Csd::PPS),
+            _ => None,
         }
     }
 }
