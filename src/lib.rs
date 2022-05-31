@@ -83,10 +83,10 @@ fn main_loop(receiver: Receiver<NativeActivityEvent>) -> anyhow::Result<()> {
 
     let mut destroy_called = false;
 
-
     let asset_manager = unsafe { (&*activity.as_ptr()).assetManager };
     let csd = debug::get_csd(asset_manager)?;
     let packets = debug::get_h264_packets(asset_manager)?;
+
     let format = media_format::MediaFormat::create_video_format(
         media_format::VideoType::H264,
         1920,
@@ -96,8 +96,13 @@ fn main_loop(receiver: Receiver<NativeActivityEvent>) -> anyhow::Result<()> {
     )?;
 
     let decoder = decoder::MediaDecoder::create_from_format(&format, window)?;
-    
+
     info!("GREAT SUCCESS");
+
+    decoder.start()?;
+
+    let mut time = 0;
+    let mut packet_index = 0;
 
     loop {
         let msg = match receiver.try_recv() {
@@ -121,7 +126,20 @@ fn main_loop(receiver: Receiver<NativeActivityEvent>) -> anyhow::Result<()> {
                 _ => (),
             },
             Err(e) => match e {
-                TryRecvError::Empty => {}
+                TryRecvError::Empty => {
+                    if let Some(packet) = packets.get(packet_index) {
+                        let end_of_stream = if packet_index == packets.len() - 1 {
+                            true
+                        } else {
+                            false
+                        };
+                        if decoder.try_queue_input(&packet, time, end_of_stream)? {
+                            time += 16_666;
+                            packet_index += 1;
+                        }
+                    }
+                    decoder.try_get_output()?;
+                }
                 TryRecvError::Disconnected => {
                     if destroy_called {
                         info!("Exiting loop");
