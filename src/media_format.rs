@@ -4,7 +4,7 @@ use ndk_sys::{
     AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_MIME,
     AMEDIAFORMAT_KEY_WIDTH,
 };
-use std::ptr::NonNull;
+use std::{os::raw::c_char, ptr::NonNull};
 
 #[repr(transparent)]
 pub(crate) struct MediaFormat(NonNull<AMediaFormat>);
@@ -25,46 +25,30 @@ impl MediaFormat {
         frame_rate: i32,
         csd: &[u8],
     ) -> anyhow::Result<Self> {
-        unsafe {
-            if let Some(media_format) = NonNull::new(AMediaFormat_new()) {
-                let mut media_format = MediaFormat(media_format);
+        let mut media_format = {
+            let ptr = unsafe { AMediaFormat_new() };
+            match NonNull::new(ptr) {
+                Some(media_format) => MediaFormat(media_format),
+                None => anyhow::bail!("AMediaFormat_new returned a null"),
+            }
+        };
 
-                media_format.set_video_type(video_type);
-                media_format.set_width(width);
-                media_format.set_height(height);
-                media_format.set_frame_rate(frame_rate);
+        media_format.set_video_type(video_type);
+        media_format.set_width(width);
+        media_format.set_height(height);
+        media_format.set_frame_rate(frame_rate);
 
-                match video_type {
-                    VideoType::H264 => {
-                        let boundaries = nal_boundaries(csd);
-
-                        if boundaries.len() == 2 {
-                            if let (Some(first), Some(second)) = (
-                                csd.get(boundaries[0]..boundaries[1]),
-                                csd.get(boundaries[1]..),
-                            ) {
-                                if let (Some(csd0), Some(csd1)) = (
-                                    H264Csd::get_nal_unit_type(first),
-                                    H264Csd::get_nal_unit_type(second),
-                                ) {
-                                    if csd0 != csd1 {
-                                        media_format.set_h264_csd(csd0, first);
-                                        media_format.set_h264_csd(csd1, second);
-                                        crate::info!("SUccess");
-                                        return Ok(media_format);
-                                    }
-                                }
-                            }
-                        }
-
-                        anyhow::bail!("Invalid SPS/PPS data")
-                    }
-                    VideoType::Hevc => todo!(),
-                }
-            } else {
-                anyhow::bail!("AMediaFormat_new returned a null");
+        match video_type {
+            VideoType::H264 => match H264Csd::from_slice(csd) {
+                Some(h264_csd) => h264_csd.add_to_format(&mut media_format),
+                None => anyhow::bail!("Invalid codec specific data")
+            },
+            VideoType::Hevc => match HevcCsd::from_slice(csd) {
+                Some(hevc_csd) => hevc_csd.add_to_format(&mut media_format),
+                None => anyhow::bail!("Invalid codec specific data")
             }
         }
+        Ok(media_format)
     }
 
     pub(crate) fn as_inner(&self) -> *mut AMediaFormat {
@@ -99,18 +83,14 @@ impl MediaFormat {
         }
     }
 
-    fn set_h264_csd(&mut self, csd: H264Csd, data: &[u8]) {
-        let name = match csd {
-            H264Csd::SPS => "csd-0\0",
-            H264Csd::PPS => "csd-1\0",
-        };
+    fn set_buffer(&mut self, name: *const c_char, data: &[u8]) {
         unsafe {
             AMediaFormat_setBuffer(
                 self.as_inner(),
-                name.as_ptr().cast(),
+                name,
                 data.as_ptr().cast(),
                 data.len() as u64,
-            );
+            )
         }
     }
 
@@ -161,23 +141,63 @@ fn nal_boundaries(data: &[u8]) -> Vec<usize> {
     boundaries
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum H264Csd {
-    SPS = 7,
-    PPS = 8,
+struct H264Csd<'a> {
+    csd0: &'a [u8],
+    csd1: &'a [u8],
 }
 
-impl H264Csd {
-    const SPS_NAL_UNIT_TYPE: u8 = 7;
-    const PPS_NAL_UNIT_TYPE: u8 = 8;
-    const NAL_UNIT_TYPE_MASK: u8 = 0b11111;
+impl<'a> H264Csd<'a> {
+    fn from_slice(data: &'a [u8]) -> Option<Self> {
+        const SPS_NAL_UNIT_TYPE: u8 = 7;
+        const PPS_NAL_UNIT_TYPE: u8 = 8;
+        const NAL_UNIT_TYPE_MASK: u8 = 0b11111;
 
-    fn get_nal_unit_type(data: &[u8]) -> Option<H264Csd> {
-        let v = data.get(4)?;
-        match v & H264Csd::NAL_UNIT_TYPE_MASK {
-            H264Csd::SPS_NAL_UNIT_TYPE => Some(H264Csd::SPS),
-            H264Csd::PPS_NAL_UNIT_TYPE => Some(H264Csd::PPS),
-            _ => None,
+        let mut csd0 = None;
+        let mut csd1 = None;
+
+        let mut check_nal_type = |data: &'a [u8]| -> Option<()> {
+            match data.get(4)? & NAL_UNIT_TYPE_MASK {
+                SPS_NAL_UNIT_TYPE => csd0 = Some(data),
+                PPS_NAL_UNIT_TYPE => csd1 = Some(data),
+                _ => (),
+            }
+            Some(())
+        };
+
+        let boundaries = nal_boundaries(data);
+
+        if boundaries.len() != 2 {
+            return None;
         }
+
+        let first = data.get(boundaries[0]..boundaries[1])?;
+        let second = data.get(boundaries[1]..)?;
+
+        check_nal_type(first)?;
+        check_nal_type(second)?;
+
+        Some(H264Csd {
+            csd0: csd0?,
+            csd1: csd1?
+        })
+    }
+
+    fn add_to_format(&self, media_format: &mut MediaFormat) {
+        media_format.set_buffer("csd-0\0".as_ptr().cast(), self.csd0);
+        media_format.set_buffer("csd-1\0".as_ptr().cast(), self.csd1);
+    }
+}
+
+struct HevcCsd<'a> {
+    csd0: &'a [u8]
+}
+
+impl<'a> HevcCsd<'a> {
+    fn from_slice(_data: &'a [u8]) -> Option<Self> {
+        todo!()
+    }
+
+    fn add_to_format(&self, media_format: &mut MediaFormat) {
+        media_format.set_buffer("csd-0\0".as_ptr().cast(), self.csd0);
     }
 }
