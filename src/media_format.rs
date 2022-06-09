@@ -1,8 +1,9 @@
 use ndk_sys::{
     AMediaFormat, AMediaFormat_delete, AMediaFormat_getString, AMediaFormat_new,
     AMediaFormat_setBuffer, AMediaFormat_setInt32, AMediaFormat_setString,
-    AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_MIME,
-    AMEDIAFORMAT_KEY_WIDTH,
+    AMEDIAFORMAT_KEY_BIT_RATE, AMEDIAFORMAT_KEY_CSD_0, AMEDIAFORMAT_KEY_CSD_1,
+    AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_MAX_BIT_RATE,
+    AMEDIAFORMAT_KEY_MIME, AMEDIAFORMAT_KEY_PRIORITY, AMEDIAFORMAT_KEY_WIDTH, AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MAX_HEIGHT
 };
 use std::{os::raw::c_char, ptr::NonNull};
 
@@ -41,18 +42,27 @@ impl MediaFormat {
         match video_type {
             VideoType::H264 => match H264Csd::from_slice(csd) {
                 Some(h264_csd) => h264_csd.add_to_format(&mut media_format),
-                None => anyhow::bail!("Invalid codec specific data")
+                None => anyhow::bail!("Invalid codec specific data"),
             },
             VideoType::Hevc => match HevcCsd::from_slice(csd) {
                 Some(hevc_csd) => hevc_csd.add_to_format(&mut media_format),
-                None => anyhow::bail!("Invalid codec specific data")
-            }
+                None => anyhow::bail!("Invalid codec specific data"),
+            },
         }
         Ok(media_format)
     }
 
     pub(crate) fn as_inner(&self) -> *mut AMediaFormat {
         self.0.as_ptr()
+    }
+
+    pub(crate) fn get_mime_type(&self) -> *const c_char {
+        unsafe {
+            // Resulting string is owned by the `AMediaFormat`
+            let mut cstr: *const c_char = std::ptr::null();
+            AMediaFormat_getString(self.as_inner(), AMEDIAFORMAT_KEY_MIME, &mut cstr);
+            cstr
+        }
     }
 
     fn set_video_type(&mut self, video_type: VideoType) {
@@ -68,18 +78,42 @@ impl MediaFormat {
     fn set_width(&mut self, width: i32) {
         unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_WIDTH, width);
+            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_MAX_WIDTH, width);
         }
     }
 
     fn set_height(&mut self, height: i32) {
         unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_HEIGHT, height);
+            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_MAX_HEIGHT, height);
         }
     }
 
     fn set_frame_rate(&mut self, frame_rate: i32) {
         unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_FRAME_RATE, frame_rate);
+        }
+    }
+
+    fn set_bit_rate(&mut self, bit_rate: i32) {
+        unsafe {
+            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_BIT_RATE, bit_rate);
+        }
+    }
+
+    fn set_max_bit_rate(&mut self, max_bit_rate: i32) {
+        unsafe {
+            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_MAX_BIT_RATE, max_bit_rate);
+        }
+    }
+
+    fn set_realtime_priority(&mut self, realtime: bool) {
+        unsafe {
+            AMediaFormat_setInt32(
+                self.as_inner(),
+                AMEDIAFORMAT_KEY_PRIORITY,
+                if realtime { 0 } else { 1 },
+            );
         }
     }
 
@@ -91,14 +125,6 @@ impl MediaFormat {
                 data.as_ptr().cast(),
                 data.len() as u64,
             )
-        }
-    }
-
-    pub(crate) fn get_mime_type(&self) -> *const i8 {
-        unsafe {
-            let mut cstr: *const i8 = std::ptr::null();
-            AMediaFormat_getString(self.as_inner(), AMEDIAFORMAT_KEY_MIME, &mut cstr);
-            cstr
         }
     }
 }
@@ -178,18 +204,18 @@ impl<'a> H264Csd<'a> {
 
         Some(H264Csd {
             csd0: csd0?,
-            csd1: csd1?
+            csd1: csd1?,
         })
     }
 
     fn add_to_format(&self, media_format: &mut MediaFormat) {
-        media_format.set_buffer("csd-0\0".as_ptr().cast(), self.csd0);
-        media_format.set_buffer("csd-1\0".as_ptr().cast(), self.csd1);
+        media_format.set_buffer(unsafe { AMEDIAFORMAT_KEY_CSD_0 }, self.csd0);
+        media_format.set_buffer(unsafe { AMEDIAFORMAT_KEY_CSD_1 }, self.csd1);
     }
 }
 
 struct HevcCsd<'a> {
-    csd0: &'a [u8]
+    csd0: &'a [u8],
 }
 
 impl<'a> HevcCsd<'a> {
@@ -198,6 +224,6 @@ impl<'a> HevcCsd<'a> {
     }
 
     fn add_to_format(&self, media_format: &mut MediaFormat) {
-        media_format.set_buffer("csd-0\0".as_ptr().cast(), self.csd0);
+        media_format.set_buffer(unsafe { AMEDIAFORMAT_KEY_CSD_0 }, self.csd0);
     }
 }

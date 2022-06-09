@@ -17,7 +17,7 @@ use std::{
 
 // adb logcat -v raw -s client-android
 // adb install target\debug\apk\client-android.apk
-// C:\Users\Rafael\AppData\Local\Android\Sdk\emulator\emulator -avd Pixel_3_API_31
+// C:\Users\Rafael\AppData\Local\Android\Sdk\emulator\emulator -avd Pixel_3_XL_API_31
 
 #[no_mangle]
 unsafe extern "C" fn ANativeActivity_onCreate(

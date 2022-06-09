@@ -38,20 +38,56 @@ impl MediaDecoder {
         };
 
         decoder.configure(format, raw_native_window)?;
+        decoder.read_output_format();
         decoder.start()?;
         Ok(decoder)
     }
 
+    fn read_output_format(&self) {
+        use ndk_sys::{
+            AMediaCodec_getOutputFormat, AMediaFormat_delete, AMediaFormat_getInt32,
+            AMEDIAFORMAT_KEY_BIT_RATE, AMEDIAFORMAT_KEY_MAX_BIT_RATE, AMEDIAFORMAT_KEY_WIDTH, AMEDIAFORMAT_KEY_HEIGHT,
+            AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MAX_HEIGHT,
+            AMEDIAFORMAT_KEY_TILE_WIDTH, AMEDIAFORMAT_KEY_TILE_HEIGHT,
+        };
+
+        unsafe {
+            let format = AMediaCodec_getOutputFormat(self.as_inner());
+            if !format.is_null() {
+                crate::info!("-------- output format");
+                let mut x = 0;
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, &mut x) {
+                    crate::info!("  bit rate: {}", x);
+                }
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_MAX_BIT_RATE, &mut x) {
+                    crate::info!("  max bit rate: {}", x);
+                }
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_WIDTH, &mut x) {
+                    crate::info!("  width: {}", x);
+                }
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_HEIGHT, &mut x) {
+                    crate::info!("  height: {}", x);
+                }
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_MAX_WIDTH, &mut x) {
+                    crate::info!("  max width: {}", x);
+                }
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_MAX_HEIGHT, &mut x) {
+                    crate::info!("  max height: {}", x);
+                }
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_TILE_WIDTH, &mut x) {
+                    crate::info!("  tile width: {}", x);
+                }
+                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_TILE_HEIGHT, &mut x) {
+                    crate::info!("  tile height: {}", x);
+                }
+                
+                AMediaFormat_delete(format);
+            }
+        }
+    }
+
     pub(crate) fn as_inner(&self) -> *mut AMediaCodec {
         self.0.as_ptr()
-    }
-
-    pub(crate) fn start(&self) -> Result<(), MediaStatus> {
-        unsafe { AMediaCodec_start(self.as_inner()).success() }
-    }
-
-    pub(crate) fn stop(&self) -> Result<(), MediaStatus> {
-        unsafe { AMediaCodec_stop(self.as_inner()).success() }
     }
 
     pub(crate) fn set_output_surface(
@@ -131,6 +167,14 @@ impl MediaDecoder {
             )
             .success()
         }
+    }
+
+    fn start(&self) -> Result<(), MediaStatus> {
+        unsafe { AMediaCodec_start(self.as_inner()).success() }
+    }
+
+    fn stop(&self) -> Result<(), MediaStatus> {
+        unsafe { AMediaCodec_stop(self.as_inner()).success() }
     }
 
     fn dequeue_input_buffer(&self, timeout_us: i64) -> c_long {
