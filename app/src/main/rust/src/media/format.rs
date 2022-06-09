@@ -1,11 +1,15 @@
 use ndk_sys::{
     AMediaFormat, AMediaFormat_delete, AMediaFormat_getString, AMediaFormat_new,
     AMediaFormat_setBuffer, AMediaFormat_setInt32, AMediaFormat_setString,
-    AMEDIAFORMAT_KEY_BIT_RATE, AMEDIAFORMAT_KEY_CSD_0, AMEDIAFORMAT_KEY_CSD_1,
-    AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_MAX_BIT_RATE,
-    AMEDIAFORMAT_KEY_MIME, AMEDIAFORMAT_KEY_PRIORITY, AMEDIAFORMAT_KEY_WIDTH, AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MAX_HEIGHT
+    AMEDIAFORMAT_KEY_BIT_RATE, AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT,
+    AMEDIAFORMAT_KEY_MAX_HEIGHT, AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MIME,
+    AMEDIAFORMAT_KEY_PRIORITY, AMEDIAFORMAT_KEY_WIDTH,
 };
 use std::{os::raw::c_char, ptr::NonNull};
+
+// `AMEDIAFORMAT_KEY_CSD_0` and `AMEDIAFORMAT_KEY_CSD_1` only became available in API level 28
+const MEDIAFORMAT_KEY_CSD_0: &'static str = "csd-0\0";
+const MEDIAFORMAT_KEY_CSD_1: &'static str = "csd-1\0";
 
 #[repr(transparent)]
 pub(crate) struct MediaFormat(NonNull<AMediaFormat>);
@@ -38,6 +42,10 @@ impl MediaFormat {
         media_format.set_width(width);
         media_format.set_height(height);
         media_format.set_frame_rate(frame_rate);
+
+        // Used for adaptive playback
+        media_format.set_max_width(width);
+        media_format.set_max_height(height);
 
         match video_type {
             VideoType::H264 => match H264Csd::from_slice(csd) {
@@ -78,6 +86,11 @@ impl MediaFormat {
     fn set_width(&mut self, width: i32) {
         unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_WIDTH, width);
+        }
+    }
+
+    fn set_max_width(&mut self, width: i32) {
+        unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_MAX_WIDTH, width);
         }
     }
@@ -85,6 +98,11 @@ impl MediaFormat {
     fn set_height(&mut self, height: i32) {
         unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_HEIGHT, height);
+        }
+    }
+
+    fn set_max_height(&mut self, height: i32) {
+        unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_MAX_HEIGHT, height);
         }
     }
@@ -98,12 +116,6 @@ impl MediaFormat {
     fn set_bit_rate(&mut self, bit_rate: i32) {
         unsafe {
             AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_BIT_RATE, bit_rate);
-        }
-    }
-
-    fn set_max_bit_rate(&mut self, max_bit_rate: i32) {
-        unsafe {
-            AMediaFormat_setInt32(self.as_inner(), AMEDIAFORMAT_KEY_MAX_BIT_RATE, max_bit_rate);
         }
     }
 
@@ -148,6 +160,7 @@ impl VideoType {
     }
 }
 
+/// Find the starting positions of the [0x0, 0x0, 0x0, 0x1] marker.
 fn nal_boundaries(data: &[u8]) -> Vec<usize> {
     let mut boundaries = Vec::with_capacity(3);
 
@@ -167,12 +180,16 @@ fn nal_boundaries(data: &[u8]) -> Vec<usize> {
     boundaries
 }
 
+/// Used for manually setting H264 specific data. `AMediaFormat_setBuffer` with
+/// `AMEDIAFORMAT_KEY_CSD_AVC` (API level >=29) can be used to pass the CSD buffer as a whole.
 struct H264Csd<'a> {
     csd0: &'a [u8],
     csd1: &'a [u8],
 }
 
 impl<'a> H264Csd<'a> {
+    /// Create a `H264Csd` from a byte buffer. This involves finding where the SPS and PPS are in
+    /// the buffer. Returns `None` if they cannot be found.
     fn from_slice(data: &'a [u8]) -> Option<Self> {
         const SPS_NAL_UNIT_TYPE: u8 = 7;
         const PPS_NAL_UNIT_TYPE: u8 = 8;
@@ -208,22 +225,28 @@ impl<'a> H264Csd<'a> {
         })
     }
 
+    /// Include the content specific data in the format.
     fn add_to_format(&self, media_format: &mut MediaFormat) {
-        media_format.set_buffer(unsafe { AMEDIAFORMAT_KEY_CSD_0 }, self.csd0);
-        media_format.set_buffer(unsafe { AMEDIAFORMAT_KEY_CSD_1 }, self.csd1);
+        media_format.set_buffer(MEDIAFORMAT_KEY_CSD_0.as_ptr().cast(), self.csd0);
+        media_format.set_buffer(MEDIAFORMAT_KEY_CSD_1.as_ptr().cast(), self.csd1);
     }
 }
 
+/// Used for manually setting HEVC specific data. `AMediaFormat_setBuffer` with
+/// `AMEDIAFORMAT_KEY_CSD_HEVC` (API level >=29) can be used instead.
 struct HevcCsd<'a> {
     csd0: &'a [u8],
 }
 
 impl<'a> HevcCsd<'a> {
+    /// Create a `HevcCsd` from a byte buffer. This needs to check for the presence of VPS, SPS and
+    /// PPS NALs. Returns `None` if it fails.
     fn from_slice(_data: &'a [u8]) -> Option<Self> {
         todo!()
     }
 
+    /// Include the content specific data in the format.
     fn add_to_format(&self, media_format: &mut MediaFormat) {
-        media_format.set_buffer(unsafe { AMEDIAFORMAT_KEY_CSD_0 }, self.csd0);
+        media_format.set_buffer(MEDIAFORMAT_KEY_CSD_0.as_ptr().cast(), self.csd0);
     }
 }
