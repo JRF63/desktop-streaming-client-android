@@ -1,6 +1,7 @@
 package com.debug.myapplication
 
 import android.os.Bundle
+import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
 import androidx.appcompat.app.AppCompatActivity
@@ -21,8 +22,11 @@ class StreamingActivity : AppCompatActivity() {
         setContentView(binding.root)
         layoutConstraints.clone(binding.root)
 
+        Log.i("client-android", "calling createNativeInstance")
         nativeInstance = createNativeInstance(nativeInstance)
         // TODO: If zero, switch back to main activity
+
+        Log.i("client-android", "after createNativeInstance")
 
         binding.surfaceView.holder.addCallback(object: SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {

@@ -7,8 +7,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-jni = "0.19"
-ndk-sys = { version = "0.3", features = ["media"] }
 anyhow = "1.0"
 crossbeam-channel = "0.5"
-
+jni = "0.19"
+ndk-sys = { version = "0.3", features = ["media"] }
+tokio = "1.24.1"
+webrtc = "0.6"
+webrtc-helper = { path = "../../../../../webrtc-helper" }

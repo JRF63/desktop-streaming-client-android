@@ -50,37 +50,39 @@ android {
     buildFeatures {
         viewBinding true
     }
+}
 
-    android.applicationVariants.all {  variant ->
-        def arch = variant.productFlavors.name[0]
-        if (arch == "arm64_v8a") {
-            arch = 'arm64-v8a' // replace `_` with `-`
-        }
+android.applicationVariants.all {  variant ->
+    def arch = variant.productFlavors.name[0]
+    if (arch == "arm64_v8a") {
+        arch = 'arm64-v8a' // replace `_` with `-`
+    }
 
-        def triple = ndkTriple(arch)
-        def isRelease = variant.buildType.name == "release"
+    def triple = ndkTriple(arch)
+    def isRelease = variant.buildType.name == "release"
 
-        def argsList = ['build', '--target', triple]
-        if (isRelease) {
-            argsList.add('--release')
-        }
+    def argsList = ['build', '--target', triple]
+    if (isRelease) {
+        argsList.add('--release')
+    }
 
-        // Run cargo only on the current variant being built
-        variant.generateBuildConfigProvider.configure {
-            it.doFirst {
-                exec {
-                    workingDir 'src/main/rust'
-                    executable 'cargo'
-                    args argsList
-                    environment[cargoLinkerEnvVarKey(triple)] = clangBinary(triple, variant.mergedFlavor.minSdkVersion.apiLevel)
-                }
+    // Run cargo only on the current variant being built
+    variant.generateBuildConfigProvider.configure {
+        it.doFirst {
+            exec {
+                workingDir 'src/main/rust'
+                executable 'cargo'
+                args argsList
+                environment[cargoLinkerEnvVarKey(triple)] = clangBinary(triple, variant.mergedFlavor.minSdkVersion.apiLevel)
+                environment['CC'] = clangBinary(triple, variant.mergedFlavor.minSdkVersion.apiLevel)
+                environment['AR'] = arBinary()
             }
-            it.doLast {
-                copy {
-                    from "src/main/rust/target/${triple}/${isRelease ? 'release' : 'debug'}"
-                    into "src/${isRelease ? 'main' : 'debug'}/jniLibs/${arch}"
-                    include '*.so'
-                }
+        }
+        it.doLast {
+            copy {
+                from "src/main/rust/target/${triple}/${isRelease ? 'release' : 'debug'}"
+                into "src/${isRelease ? 'main' : 'debug'}/jniLibs/${arch}"
+                include '*.so'
             }
         }
     }
@@ -129,4 +131,9 @@ def cargoLinkerEnvVarKey(triple) {
 def clangBinary(triple, sdk) {
     def ext = hostOs().contains('windows') ? '.cmd' : ''
     ndkToolchainDir().resolve("bin/${triple}${sdk}-clang${ext}")
+}
+
+def arBinary() {
+    def ext = hostOs().contains('windows') ? '.exe' : ''
+    ndkToolchainDir().resolve("bin/llvm-ar${ext}")
 }

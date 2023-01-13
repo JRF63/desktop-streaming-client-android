@@ -14,14 +14,16 @@ use std::{
 // C:\Users\Rafael\AppData\Local\Android\Sdk\emulator\emulator -avd Pixel_3_XL_API_31
 // adb install app\build\outputs\apk\debug\app-debug.apk
 // gradlew installX86_64Debug
+// set CC=C:\Users\Rafael\AppData\Local\Android\Sdk\ndk-bundle\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd
+// set AR=C:\Users\Rafael\AppData\Local\Android\Sdk\ndk-bundle\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android-ar.exe
 
-#[export_name = "Java_com_debug_myapplication_MainActivity_a"]
+#[export_name = "Java_com_debug_myapplication_StreamingActivity_a"]
 pub extern "system" fn create_native_instance(
     env: JNIEnv,
     activity: jni::sys::jobject,
     previous_instance: jni::sys::jlong,
 ) -> jni::sys::jlong {
-    const NUM_THREADS: usize = 3;
+    const NUM_THREADS: usize = 2;
 
     fn inner_fn(
         env: JNIEnv,
@@ -32,19 +34,10 @@ pub extern "system" fn create_native_instance(
             let android_activity =
                 AndroidActivity::new(env.get_java_vm()?, env.new_global_ref(activity)?);
 
-            let (connection_loop_tx, connection_loop_rx) = crossbeam_channel::bounded(3);
             let (decode_loop_tx, decode_loop_rx) = crossbeam_channel::bounded(3);
             let barrier = Arc::new(Barrier::new(NUM_THREADS));
 
             {
-                let barrier_clone = barrier.clone();
-                thread::spawn(move || {
-                    if let Err(e) = connection_loop(connection_loop_rx) {
-                        error!("Connection loop error: {}", e);
-                    }
-                    barrier_clone.wait();
-                });
-
                 let barrier_clone = barrier.clone();
                 thread::spawn(move || {
                     if let Err(e) = decode_loop(decode_loop_rx, android_activity) {
@@ -54,12 +47,10 @@ pub extern "system" fn create_native_instance(
                 });
             }
 
-            let instance = NativeInstance::new(connection_loop_tx, decode_loop_tx, barrier);
-            let leaked_ptr = Box::into_raw(Box::new(instance));
-            Ok(leaked_ptr as usize as jni::sys::jlong)
+            let instance = Box::new(NativeInstance::new(decode_loop_tx, barrier));
+            Ok(instance.into_java_long())
         } else {
             let native_instance = unsafe { NativeInstance::from_java_long(previous_instance) };
-            let _ignored = native_instance.send_to_connection(ActivityEvent::Create);
             let _ignored = native_instance.send_to_decoder(ActivityEvent::Create);
             Ok(previous_instance)
         }
@@ -73,20 +64,19 @@ pub extern "system" fn create_native_instance(
     }
 }
 
-#[export_name = "Java_com_debug_myapplication_MainActivity_b"]
+#[export_name = "Java_com_debug_myapplication_StreamingActivity_b"]
 pub extern "system" fn send_destroy_signal(
     _env: JNIEnv,
     _activity: jni::sys::jobject,
     instance: jni::sys::jlong,
 ) {
     let native_instance = unsafe { NativeInstance::from_java_long(instance) };
-    let _ignored = native_instance.send_to_connection(ActivityEvent::Destroy);
     let _ignored = native_instance.send_to_decoder(ActivityEvent::Destroy);
     native_instance.barrier.wait();
     unsafe { NativeInstance::drop_instance(instance) }
 }
 
-#[export_name = "Java_com_debug_myapplication_MainActivity_c"]
+#[export_name = "Java_com_debug_myapplication_StreamingActivity_c"]
 pub extern "system" fn send_surface_created(
     env: JNIEnv,
     _activity: jni::sys::jobject,
@@ -109,7 +99,7 @@ pub extern "system" fn send_surface_created(
     }
 }
 
-#[export_name = "Java_com_debug_myapplication_MainActivity_d"]
+#[export_name = "Java_com_debug_myapplication_StreamingActivity_d"]
 pub extern "system" fn send_surface_destroyed(
     _env: JNIEnv,
     _activity: jni::sys::jobject,
@@ -117,7 +107,6 @@ pub extern "system" fn send_surface_destroyed(
 ) {
     fn inner_fn(instance: jni::sys::jlong) -> anyhow::Result<()> {
         let native_instance = unsafe { NativeInstance::from_java_long(instance) };
-        native_instance.send_to_connection(ActivityEvent::SurfaceDestroyed)?;
         native_instance.send_to_decoder(ActivityEvent::SurfaceDestroyed)?;
         Ok(())
     }
@@ -136,20 +125,24 @@ enum ActivityEvent {
 }
 
 struct NativeInstance {
-    event_senders: [crossbeam_channel::Sender<ActivityEvent>; 2],
+    event_sender: crossbeam_channel::Sender<ActivityEvent>,
     barrier: Arc<Barrier>,
 }
 
 impl NativeInstance {
     fn new(
-        connection_loop_sender: crossbeam_channel::Sender<ActivityEvent>,
         decode_loop_sender: crossbeam_channel::Sender<ActivityEvent>,
         barrier: Arc<Barrier>,
     ) -> Self {
         NativeInstance {
-            event_senders: [connection_loop_sender, decode_loop_sender],
+            event_sender: decode_loop_sender,
             barrier,
         }
+    }
+
+    fn into_java_long(self: Box<NativeInstance>) -> jni::sys::jlong {
+        let leaked_ptr = Box::into_raw(self);
+        leaked_ptr as usize as jni::sys::jlong
     }
 
     unsafe fn from_java_long<'a>(instance: jni::sys::jlong) -> &'a Self {
@@ -157,21 +150,15 @@ impl NativeInstance {
     }
 
     unsafe fn drop_instance(instance: jni::sys::jlong) {
-        let _to_drop = Box::from_raw(instance as usize as *mut NativeInstance);
+        let to_drop = Box::from_raw(instance as usize as *mut NativeInstance);
+        std::mem::drop(to_drop);
     }
 
     fn send_to_decoder(
         &self,
         event: ActivityEvent,
     ) -> Result<(), crossbeam_channel::SendError<ActivityEvent>> {
-        self.event_senders[1].send(event)
-    }
-
-    fn send_to_connection(
-        &self,
-        event: ActivityEvent,
-    ) -> Result<(), crossbeam_channel::SendError<ActivityEvent>> {
-        self.event_senders[0].send(event)
+        self.event_sender.send(event)
     }
 }
 
@@ -184,12 +171,6 @@ impl AndroidActivity {
     fn new(vm: JavaVM, activity_obj: GlobalRef) -> Self {
         Self { vm, activity_obj }
     }
-}
-
-fn connection_loop(
-    _event_receiver: crossbeam_channel::Receiver<ActivityEvent>,
-) -> anyhow::Result<()> {
-    Ok(())
 }
 
 fn decode_loop(
@@ -247,7 +228,7 @@ fn decode_loop(
                             anyhow::bail!("Unexpected state change to `OnCreate` while inside the decoding loop")
                         }
                         ActivityEvent::Destroy => {
-                            anyhow::bail!("`Destroy` was signaled before `SurfaceDestroyed`")
+                            info!("`Destroy` was signaled before `SurfaceDestroyed`")
                         }
                         ActivityEvent::SurfaceCreated(_java_surface) => {
                             anyhow::bail!("Surface was re-created while inside the decoding loop")
