@@ -24,7 +24,7 @@
             </intent-filter>
         </activity>
         <activity
-            android:name=".StreamingActivity"
+            android:name=".MediaPlayerActivity"
             android:exported="false"
             android:screenOrientation="sensorLandscape" />
     </application>

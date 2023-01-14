@@ -16,8 +16,13 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        NativeLibSingleton.destroy()
+    }
+
     fun startStreaming(view: View) {
-        val intent = Intent(this, StreamingActivity::class.java)
+        val intent = Intent(this, MediaPlayerActivity::class.java)
         startActivity(intent)
     }
 }

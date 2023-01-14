@@ -8,7 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0"
-crossbeam-channel = "0.5"
 jni = "0.19"
 ndk-sys = { version = "0.3", features = ["media"] }
 tokio = "1.24.1"
