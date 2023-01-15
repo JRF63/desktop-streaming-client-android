@@ -1,21 +1,26 @@
 use super::{
-    format::{MediaFormat, VideoType},
+    format::{MediaFormat, MediaFormatMimeType},
     status::{AsMediaStatus, MediaStatus},
 };
+use crate::window::NativeWindow;
 use ndk_sys::{
     AMediaCodec, AMediaCodecBufferInfo, AMediaCodec_configure, AMediaCodec_createDecoderByType,
     AMediaCodec_delete, AMediaCodec_dequeueInputBuffer, AMediaCodec_dequeueOutputBuffer,
     AMediaCodec_getInputBuffer, AMediaCodec_queueInputBuffer, AMediaCodec_releaseOutputBuffer,
-    AMediaCodec_setOutputSurface, AMediaCodec_start, AMediaCodec_stop, ANativeWindow,
+    AMediaCodec_setOutputSurface, AMediaCodec_start, AMediaCodec_stop,
+    AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM,
+    AMEDIACODEC_CONFIGURE_FLAG_ENCODE, AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED,
+    AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED, AMEDIACODEC_INFO_TRY_AGAIN_LATER,
 };
 use std::{
-    os::raw::{c_long, c_ulong},
+    ffi::{c_long, c_ulong},
+    mem::MaybeUninit,
     ptr::NonNull,
 };
-use crate::window::NativeWindow;
 
+/// Encapsulates a encoder/decoder.
 #[repr(transparent)]
-pub(crate) struct MediaCodec(NonNull<AMediaCodec>);
+pub struct MediaCodec(NonNull<AMediaCodec>);
 
 // FIXME: Is this safe?
 unsafe impl Send for MediaCodec {}
@@ -23,211 +28,197 @@ unsafe impl Send for MediaCodec {}
 impl Drop for MediaCodec {
     fn drop(&mut self) {
         unsafe {
-            let _ignored_result = self.stop();
+            if let Err(e) = self.signal_end_of_stream() {
+                crate::error!("Error signaling end of stream: {e}");
+            }
+            if let Err(e) = AMediaCodec_stop(self.as_inner()).success() {
+                crate::error!("Error stoping the `MediaCodec`: {e}");
+            }
             AMediaCodec_delete(self.0.as_ptr());
         }
     }
 }
 
 impl MediaCodec {
-    pub(crate) fn create_video_decoder(
-        window: &NativeWindow,
-        video_type: VideoType,
-        width: i32,
-        height: i32,
-        frame_rate: i32,
-        csd: &[u8],
-    ) -> anyhow::Result<Self> {
-        let format = MediaFormat::create_video_format(video_type, width, height, frame_rate, csd)?;
-        let mut decoder = {
-            let ptr = unsafe { AMediaCodec_createDecoderByType(format.get_mime_type()) };
-            if let Some(decoder) = NonNull::new(ptr) {
-                MediaCodec(decoder)
-            } else {
-                anyhow::bail!("`NonAMediaCodec_createDecoderByType` returned a null");
-            }
-        };
-
-        decoder.configure(&format, window)?;
-        decoder.read_output_format();
-        decoder.start()?;
-        Ok(decoder)
-    }
-
-    fn read_output_format(&self) {
-        use ndk_sys::{
-            AMediaCodec_getOutputFormat, AMediaFormat_delete, AMediaFormat_getInt32,
-            AMEDIAFORMAT_KEY_BIT_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_MAX_BIT_RATE,
-            AMEDIAFORMAT_KEY_MAX_HEIGHT, AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_TILE_HEIGHT,
-            AMEDIAFORMAT_KEY_TILE_WIDTH, AMEDIAFORMAT_KEY_WIDTH,
-        };
-
-        unsafe {
-            let format = AMediaCodec_getOutputFormat(self.as_inner());
-            if !format.is_null() {
-                crate::info!("-------- output format");
-                let mut x = 0;
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, &mut x) {
-                    crate::info!("  bit rate: {}", x);
-                }
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_MAX_BIT_RATE, &mut x) {
-                    crate::info!("  max bit rate: {}", x);
-                }
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_WIDTH, &mut x) {
-                    crate::info!("  width: {}", x);
-                }
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_HEIGHT, &mut x) {
-                    crate::info!("  height: {}", x);
-                }
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_MAX_WIDTH, &mut x) {
-                    crate::info!("  max width: {}", x);
-                }
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_MAX_HEIGHT, &mut x) {
-                    crate::info!("  max height: {}", x);
-                }
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_TILE_WIDTH, &mut x) {
-                    crate::info!("  tile width: {}", x);
-                }
-                if AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_TILE_HEIGHT, &mut x) {
-                    crate::info!("  tile height: {}", x);
-                }
-
-                // TODO: Profiles and levels
-
-                AMediaFormat_delete(format);
-            }
+    /// Create a new `MediaCodec`.
+    pub fn new<T>(kind: T) -> Result<MediaCodec, MediaStatus>
+    where
+        T: MediaFormatMimeType,
+    {
+        let ptr = unsafe { AMediaCodec_createDecoderByType(kind.mime_type().as_ptr()) };
+        if let Some(decoder) = NonNull::new(ptr) {
+            Ok(MediaCodec(decoder))
+        } else {
+            Err(MediaStatus::NoDecoderForFormat)
         }
     }
 
-    pub(crate) fn as_inner(&self) -> *mut AMediaCodec {
+    /// Convert to an Android NDK [AMediaCodec] pointer.
+    pub fn as_inner(&self) -> *mut AMediaCodec {
         self.0.as_ptr()
     }
 
-    pub(crate) fn set_output_surface(
-        &self,
-        window: &NativeWindow,
-    ) -> Result<(), MediaStatus> {
-        unsafe {
-            AMediaCodec_setOutputSurface(self.as_inner(), window.as_inner()).success()
-        }
-    }
-
-    pub(crate) fn try_decode(
-        &self,
-        data: &[u8],
-        time: u64,
-        end_of_stream: bool,
-    ) -> anyhow::Result<bool> {
-        match self.dequeue_input_buffer(0) {
-            -1 => Ok(false),
-            index => {
-                let index = index as c_ulong;
-                let buffer = self.get_input_buffer(index)?;
-
-                let min_len = data.len().min(buffer.len());
-                buffer[..min_len].copy_from_slice(&data[..min_len]);
-
-                let flags = if end_of_stream {
-                    ndk_sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32
-                } else {
-                    0
-                };
-
-                self.queue_input_buffer(index, 0, min_len as c_ulong, time, flags)?;
-                Ok(true)
-            }
-        }
-    }
-
-    pub(crate) fn try_render(&self) -> anyhow::Result<bool> {
-        const TRY_AGAIN_LATER: c_long = ndk_sys::AMEDIACODEC_INFO_TRY_AGAIN_LATER as c_long;
-        const OUTPUT_FORMAT_CHANGED: c_long =
-            ndk_sys::AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as c_long;
-        const OUTPUT_BUFFERS_CHANGED: c_long =
-            ndk_sys::AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED as c_long;
-
-        let mut buffer_info = AMediaCodecBufferInfo {
-            offset: 0,
-            size: 0,
-            presentationTimeUs: 0,
-            flags: 0,
-        };
-        match self.dequeue_output_buffer(&mut buffer_info, 0) {
-            TRY_AGAIN_LATER => Ok(false),
-            // ignoring format change assuming the underlying surface can handle it
-            OUTPUT_FORMAT_CHANGED => Ok(false),
-            // deprecated in API level 21 and this is using 23 as minimum
-            OUTPUT_BUFFERS_CHANGED => Ok(false),
-            index => {
-                self.release_output_buffer(index as c_ulong, true)?;
-                Ok(true)
-            }
-        }
-    }
-
-    fn configure(
+    /// Initializes using the given format then start the `MediaCodec`.
+    /// 
+    /// This is a combination of the configure and start steps.
+    pub fn initialize(
         &mut self,
         format: &MediaFormat,
-        window: &NativeWindow,
+        window: Option<NativeWindow>,
+        is_encoder: bool,
     ) -> Result<(), MediaStatus> {
+        let surface = if let Some(window) = window {
+            window.as_inner()
+        } else {
+            std::ptr::null_mut()
+        };
+        let flags = if is_encoder {
+            AMEDIACODEC_CONFIGURE_FLAG_ENCODE as u32
+        } else {
+            0
+        };
         unsafe {
             AMediaCodec_configure(
                 self.as_inner(),
                 format.as_inner(),
-                window.as_inner(),
+                surface,
                 std::ptr::null_mut(),
-                0,
+                flags,
+            )
+            .success()?;
+            AMediaCodec_start(self.as_inner()).success()
+        }
+    }
+
+    /// Resets the output of the decoder to a new surface.
+    pub fn set_output_surface(&self, window: &NativeWindow) -> Result<(), MediaStatus> {
+        unsafe { AMediaCodec_setOutputSurface(self.as_inner(), window.as_inner()).success() }
+    }
+
+    /// Submits the codec specific data. Must be called before `MediaCodec::decode`.
+    pub fn submit_codec_config<F>(&self, func: F) -> Result<(), MediaStatus>
+    where
+        F: FnMut(&mut [u8]) -> (usize, u64),
+    {
+        self.decode_inner(func, AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG as u32)
+    }
+
+    /// Decodes the given data.
+    pub fn decode<F>(&self, func: F) -> Result<(), MediaStatus>
+    where
+        F: FnMut(&mut [u8]) -> (usize, u64),
+    {
+        self.decode_inner(func, 0)
+    }
+
+    pub fn signal_end_of_stream(&self) -> Result<(), MediaStatus> {
+        self.decode_inner(|_| (0, 0), AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32)
+    }
+
+    #[inline(always)]
+    fn decode_inner<F>(&self, mut func: F, flags: u32) -> Result<(), MediaStatus>
+    where
+        F: FnMut(&mut [u8]) -> (usize, u64),
+    {
+        let index = self.dequeue_input_buffer(-1)?;
+        let buffer = self.get_input_buffer(index)?;
+        let (num_bytes, present_time_micros) = func(buffer);
+        self.queue_input_buffer(
+            index,
+            0,
+            num_bytes as c_ulong,
+            present_time_micros,
+            flags as u32,
+        )
+    }
+
+    /// Get the index of the next available input buffer. Returns `MediaStatus::NoAvailableBuffer`
+    /// if no buffer is available after the timeout.
+    fn dequeue_input_buffer(&self, timeout_micros: i64) -> Result<c_ulong, MediaStatus> {
+        let index = unsafe { AMediaCodec_dequeueInputBuffer(self.as_inner(), timeout_micros) };
+        match index {
+            -1 => Err(MediaStatus::NoAvailableBuffer),
+            index => Ok(index as c_ulong),
+        }
+    }
+
+    /// Get an input buffer.
+    fn get_input_buffer(&self, index: c_ulong) -> Result<&mut [u8], MediaStatus> {
+        let mut buf_size = 0;
+        unsafe {
+            let buf_ptr = AMediaCodec_getInputBuffer(self.as_inner(), index, &mut buf_size);
+            if buf_ptr.is_null() {
+                Err(MediaStatus::AllocationError)
+            } else {
+                Ok(std::slice::from_raw_parts_mut(buf_ptr, buf_size as usize))
+            }
+        }
+    }
+
+    /// Send the specified buffer to the codec for processing.
+    fn queue_input_buffer(
+        &self,
+        index: c_ulong,
+        offset: i64,
+        num_bytes: c_ulong,
+        present_time_micros: u64,
+        flags: u32,
+    ) -> Result<(), MediaStatus> {
+        unsafe {
+            AMediaCodec_queueInputBuffer(
+                self.as_inner(),
+                index,
+                offset,
+                num_bytes,
+                present_time_micros,
+                flags,
             )
             .success()
         }
     }
 
-    fn start(&self) -> Result<(), MediaStatus> {
-        unsafe { AMediaCodec_start(self.as_inner()).success() }
-    }
-
-    fn stop(&self) -> Result<(), MediaStatus> {
-        unsafe { AMediaCodec_stop(self.as_inner()).success() }
-    }
-
-    fn dequeue_input_buffer(&self, timeout_us: i64) -> c_long {
-        unsafe { AMediaCodec_dequeueInputBuffer(self.as_inner(), timeout_us) }
-    }
-
-    fn get_input_buffer(&self, index: c_ulong) -> anyhow::Result<&mut [u8]> {
-        let mut buf_size = 0;
-        unsafe {
-            let buf_ptr = AMediaCodec_getInputBuffer(self.as_inner(), index, &mut buf_size);
-            if buf_ptr.is_null() {
-                anyhow::bail!("`AMediaCodec_getInputBuffer` returned a null");
-            }
-            Ok(std::slice::from_raw_parts_mut(buf_ptr, buf_size as usize))
-        }
-    }
-
-    fn queue_input_buffer(
-        &self,
-        index: c_ulong,
-        offset: i64,
-        size: c_ulong,
-        time: u64,
-        flags: u32,
-    ) -> Result<(), MediaStatus> {
-        unsafe {
-            AMediaCodec_queueInputBuffer(self.as_inner(), index, offset, size, time, flags)
-                .success()
-        }
-    }
-
+    /// Get the index of the next available buffer of processed data.
     fn dequeue_output_buffer(
         &self,
-        buffer_info: &mut AMediaCodecBufferInfo,
-        timeout_us: i64,
+        buffer_info: *mut AMediaCodecBufferInfo,
+        timeout_micros: i64,
     ) -> c_long {
-        unsafe { AMediaCodec_dequeueOutputBuffer(self.as_inner(), buffer_info, timeout_us) }
+        unsafe { AMediaCodec_dequeueOutputBuffer(self.as_inner(), buffer_info, timeout_micros) }
     }
 
+    /// Return the buffer to the codec.
     fn release_output_buffer(&self, index: c_ulong, render: bool) -> Result<(), MediaStatus> {
         unsafe { AMediaCodec_releaseOutputBuffer(self.as_inner(), index, render).success() }
+    }
+
+    pub(crate) fn try_render(&self) -> Result<(), MediaStatus> {
+        const TRY_AGAIN_LATER: c_long = AMEDIACODEC_INFO_TRY_AGAIN_LATER as c_long;
+        const OUTPUT_FORMAT_CHANGED: c_long = AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as c_long;
+        const OUTPUT_BUFFERS_CHANGED: c_long = AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED as c_long;
+
+        // Leave uninit because this is unused.
+        let mut buffer_info = MaybeUninit::uninit();
+
+        match self.dequeue_output_buffer(buffer_info.as_mut_ptr(), -1) {
+            TRY_AGAIN_LATER => {
+                // This should be unreachable since timeout is set to be infinite
+                Err(MediaStatus::NoAvailableBuffer)
+            }
+            OUTPUT_FORMAT_CHANGED => {
+                // ignoring format change assuming the underlying surface can handle it
+                Ok(())
+            }
+
+            OUTPUT_BUFFERS_CHANGED => {
+                // Deprecated in API level 21 and this is using 23 as minimum. This should be
+                // unreachable.
+                Ok(())
+            }
+            index => {
+                // Proper index, use on `AMediaCodec_releaseOutputBuffer`
+                self.release_output_buffer(index as c_ulong, true)?;
+                Ok(())
+            }
+        }
     }
 }

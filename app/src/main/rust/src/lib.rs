@@ -37,7 +37,7 @@ impl std::fmt::Debug for MediaPlayerEvent {
     }
 }
 
-/// Thread loop that runs the native code.
+/// Thread pool that runs the native code.
 pub struct NativeLibManager {
     sender: broadcast::Sender<MediaPlayerEvent>,
     runtime: Runtime,
@@ -207,7 +207,6 @@ async fn test_decode(
     }
 }
 
-
 async fn run_decoder(
     vm: JavaVM,
     singleton: GlobalRef,
@@ -220,50 +219,54 @@ async fn run_decoder(
                     let env = vm.attach_current_thread()?;
 
                     let native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Unable to acquire an `ANativeWindow`")
-                        })?;
+                        .ok_or_else(|| anyhow::anyhow!("Unable to acquire a `ANativeWindow`"))?;
 
                     let width = 1920;
                     let height = 1080;
-                    let decoder = media::MediaCodec::create_video_decoder(
-                        &native_window,
-                        media::VideoType::H264,
-                        width,
-                        height,
-                        60,
-                        debug::CSD,
-                    )?;
-                    crate::info!("created decoder");
 
                     set_media_player_aspect_ratio(&env, &singleton, width, height)?;
-                    decoder.set_output_surface(&native_window)?;
 
-                    crate::info!("starting decoder");
+                    let mut format = media::MediaFormat::new()?;
+                    format.set_resolution(width, height);
+                    format.set_max_resolution(width, height);
+                    format.set_mime_type(media::VideoType::H264);
+                    format.set_realtime_priority(true);
 
+                    let mut decoder = media::MediaCodec::new(media::VideoType::H264)?;
+                    decoder.initialize(&format, Some(native_window), false)?;
+
+                    crate::info!("created decoder");
+
+                    const FRAME_INTERVAL_MICROS: u64 = 16_666;
+                    let dur = std::time::Duration::from_micros(FRAME_INTERVAL_MICROS);
                     let mut time = 0;
 
-                    let dur = std::time::Duration::from_micros(16_666);
+                    decoder.submit_codec_config(|buffer| {
+                        let data = debug::CSD;
+                        let min_len = data.len().min(buffer.len());
+                        buffer[..min_len].copy_from_slice(&data[..min_len]);
+                        (min_len, 0)
+                    })?;
 
                     for packet_index in 0..119 {
                         crate::info!("decode: {packet_index}");
-                        if decoder.try_decode(
-                            debug::PACKETS[packet_index],
-                            time,
-                            false,
-                        )? {
-                            time += 16_666;
-                            decoder.try_render()?;
-                            std::thread::sleep(dur);
-                        }
-                    }
-                    if decoder.try_decode(
-                        debug::PACKETS[119],
-                        time,
-                        true,
-                    )? {
+                        decoder.decode(|buffer| {
+                            let data = debug::PACKETS[packet_index];
+                            let min_len = data.len().min(buffer.len());
+                            buffer[..min_len].copy_from_slice(&data[..min_len]);
+                            (min_len, time)
+                        })?;
+                        time += FRAME_INTERVAL_MICROS;
                         decoder.try_render()?;
+                        std::thread::sleep(dur);
                     }
+                    decoder.decode(|buffer| {
+                        let data = debug::PACKETS[119];
+                        let min_len = data.len().min(buffer.len());
+                        buffer[..min_len].copy_from_slice(&data[..min_len]);
+                        (min_len, time)
+                    })?;
+                    decoder.try_render()?;
                 }
                 msg => anyhow::bail!("Unexpected message while waiting for a surface: {msg:?}"),
             },
