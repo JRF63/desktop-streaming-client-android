@@ -17,6 +17,9 @@ use crate::window::NativeWindow;
 #[repr(transparent)]
 pub(crate) struct MediaCodec(NonNull<AMediaCodec>);
 
+// FIXME: Is this safe?
+unsafe impl Send for MediaCodec {}
+
 impl Drop for MediaCodec {
     fn drop(&mut self) {
         unsafe {

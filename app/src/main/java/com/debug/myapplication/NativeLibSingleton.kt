@@ -7,13 +7,21 @@ object NativeLibSingleton {
     private var mediaPlayerActivity: MediaPlayerActivity? = null
 
     @JvmName("createNativeInstance")
-    private external fun createNativeInstance(nativeInstance: Long): Long
+    private external fun createNativeInstance(): Long
     @JvmName("destroyNativeInstance")
     private external fun destroyNativeInstance(nativeInstance: Long)
 
+    @JvmName("sendSurface")
+    private external fun sendSurface(nativeInstance: Long, surface: Surface)
+    @JvmName("destroySurface")
+    private external fun destroySurface(nativeInstance: Long)
+
+    @JvmName("startMediaPlayer")
+    private external fun startMediaPlayer(nativeInstance: Long)
+
     init {
         System.loadLibrary("client_android")
-        nativeInstance = createNativeInstance(0)
+        nativeInstance = createNativeInstance()
     }
 
     fun destroy() {
@@ -24,7 +32,7 @@ object NativeLibSingleton {
 
     fun mediaPlayerCreated(mediaPlayer: MediaPlayerActivity) {
         mediaPlayerActivity = mediaPlayer
-        // TODO
+        startMediaPlayer(nativeInstance)
     }
 
     fun mediaPlayerDestroyed() {
@@ -32,11 +40,11 @@ object NativeLibSingleton {
     }
 
     fun mediaPlayerSurfaceCreated(surface: Surface) {
-        // TODO
+        sendSurface(nativeInstance, surface)
     }
 
     fun mediaPlayerSurfaceDestroyed() {
-        // TODO
+        destroySurface(nativeInstance)
     }
 
     // Called by native code

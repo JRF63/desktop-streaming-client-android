@@ -2,9 +2,9 @@ use std::sync::Arc;
 use webrtc::{rtp_transceiver::rtp_receiver::RTCRtpReceiver, track::track_remote::TrackRemote};
 use webrtc_helper::{codecs::Codec, decoder::DecoderBuilder};
 
-pub struct AndroidDecoder {}
+pub struct AndroidDecoderBuilder {}
 
-impl DecoderBuilder for AndroidDecoder {
+impl DecoderBuilder for AndroidDecoderBuilder {
     fn supported_codecs(&self) -> &[Codec] {
         todo!()
     }

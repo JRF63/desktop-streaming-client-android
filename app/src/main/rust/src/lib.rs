@@ -1,218 +1,276 @@
-mod activity;
-mod activities;
 mod debug;
 mod decoder;
-mod lifecycle;
 mod log;
 mod media;
+mod util;
 mod window;
-
-use self::{
-    activity::AndroidActivity,
-    lifecycle::{ActivityEvent, NativeInstance},
-};
-use jni::JNIEnv;
 
 // adb logcat -v raw -s client-android
 // C:\Users\Rafael\AppData\Local\Android\Sdk\emulator\emulator -avd Pixel_3_XL_API_31
 // gradlew installX86_64Debug
 
-/// (Re)-initializes the native instance. Should be called on `onCreate`.
-#[export_name = "Java_com_debug_myapplication_StreamingActivity_a"]
-pub extern "system" fn create_native_instance(
-    env: JNIEnv,
-    activity: jni::sys::jobject,
-    previous_instance: jni::sys::jlong,
-) -> jni::sys::jlong {
-    // If there is a running instance, return it back after signaling `onCreate`.
-    if previous_instance != 0 {
-        let native_instance = unsafe { NativeInstance::as_ref(previous_instance) };
-        native_instance.signal_event(ActivityEvent::Create);
-        previous_instance
+use jni::{objects::GlobalRef, JNIEnv, JavaVM};
+use std::future::Future;
+use tokio::{
+    runtime::{self, Runtime},
+    sync::broadcast,
+};
 
-    // else create a new native instance
-    } else {
-        match AndroidActivity::new(&env, activity) {
-            Ok(android_activity) => {
-                let instance = NativeInstance::new(move |receiver| {
-                    // TODO
-                    dummy_loop(receiver, android_activity);
-                });
-                let instance = Box::new(instance);
-                instance.into_java_long()
-            }
-            Err(e) => {
-                crate::error!("{e}");
-                0
-            }
+pub const RUNTIME_WORKER_THREADS: usize = 2;
+pub const BROADCAST_CHANNEL_CAPACITY: usize = 8;
+
+/// Events that are of interest to the media player.
+#[derive(Clone)]
+pub enum MediaPlayerEvent {
+    MainActivityDestroyed,
+    SurfaceCreated(GlobalRef),
+    SurfaceDestroyed,
+}
+
+impl std::fmt::Debug for MediaPlayerEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MainActivityDestroyed => write!(f, "MainActivityDestroyed"),
+            Self::SurfaceCreated(_) => write!(f, "SurfaceCreated"),
+            Self::SurfaceDestroyed => write!(f, "SurfaceDestroyed"),
         }
     }
 }
 
-/// `onDestroy` handler.
-#[export_name = "Java_com_debug_myapplication_StreamingActivity_b"]
-pub extern "system" fn on_destroy(
-    _env: JNIEnv,
-    _activity: jni::sys::jobject,
-    instance: jni::sys::jlong,
-) {
-    let native_instance = unsafe { NativeInstance::from_raw_integer(instance) };
-    native_instance.signal_event(ActivityEvent::Destroy);
-    native_instance.join();
+/// Thread loop that runs the native code.
+pub struct NativeLibManager {
+    sender: broadcast::Sender<MediaPlayerEvent>,
+    runtime: Runtime,
 }
 
-/// `surfaceCreated` handler.
-#[export_name = "Java_com_debug_myapplication_StreamingActivity_c"]
-pub extern "system" fn surface_created(
+impl NativeLibManager {
+    /// Create a `NativeLibManager`.
+    pub fn new() -> Result<NativeLibManager, std::io::Error> {
+        let runtime = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(RUNTIME_WORKER_THREADS)
+            .build()?;
+        let (sender, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+
+        Ok(NativeLibManager { sender, runtime })
+    }
+
+    /// Signal an `ActivityEvent`.
+    pub fn signal_event(&self, event: MediaPlayerEvent) {
+        if let Err(e) = self.sender.send(event) {
+            crate::error!("{e}");
+        }
+    }
+
+    /// Reinterpret a [Box] as a 64-bit integer which can be stored in Kotlin/Java.
+    pub fn into_java_long(self: Box<NativeLibManager>) -> jni::sys::jlong {
+        let leaked_ptr = Box::into_raw(self);
+        leaked_ptr as usize as jni::sys::jlong
+    }
+
+    /// Convert a previously stored integer back into a `NativeLibManager`. The value of `instance`
+    /// is no longer valid after this call.
+    pub unsafe fn from_raw_integer(instance: jni::sys::jlong) -> Box<NativeLibManager> {
+        Box::from_raw(instance as usize as *mut NativeLibManager)
+    }
+
+    /// Reinterpret an integer as a reference to a `NativeLibManager` without taking ownership.
+    pub unsafe fn as_ref<'a>(instance: jni::sys::jlong) -> &'a Self {
+        &*(instance as usize as *const NativeLibManager)
+    }
+
+    pub fn spawn_media_player<T, F>(&self, vm: JavaVM, singleton: GlobalRef, func: T)
+    where
+        T: FnOnce(JavaVM, GlobalRef, broadcast::Receiver<MediaPlayerEvent>) -> F,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let receiver = self.sender.subscribe();
+        self.runtime.spawn(func(vm, singleton, receiver));
+    }
+}
+
+/// Initializes the native library.
+#[export_name = "Java_com_debug_myapplication_NativeLibSingleton_createNativeInstance"]
+pub extern "system" fn create_native_instance(
+    _env: JNIEnv,
+    _singleton: jni::sys::jobject,
+) -> jni::sys::jlong {
+    match NativeLibManager::new() {
+        Ok(instance) => Box::new(instance).into_java_long(),
+        Err(e) => {
+            crate::error!("Error creating native instance: {e}");
+            0
+        }
+    }
+}
+
+/// Frees the native library.
+#[export_name = "Java_com_debug_myapplication_NativeLibSingleton_destroyNativeInstance"]
+pub extern "system" fn destroy_native_instance(
+    _env: JNIEnv,
+    _singleton: jni::sys::jobject,
+    ptr: jni::sys::jlong,
+) {
+    debug_assert_ne!(ptr, 0);
+    let boxed = unsafe { NativeLibManager::from_raw_integer(ptr) };
+    boxed.signal_event(MediaPlayerEvent::MainActivityDestroyed);
+    let instance = *boxed;
+    instance.runtime.shutdown_background();
+}
+
+#[export_name = "Java_com_debug_myapplication_NativeLibSingleton_sendSurface"]
+pub extern "system" fn send_surface(
     env: JNIEnv,
-    _activity: jni::sys::jobject,
-    instance: jni::sys::jlong,
+    _singleton: jni::sys::jobject,
+    ptr: jni::sys::jlong,
     surface: jni::sys::jobject,
 ) {
-    let native_instance = unsafe { NativeInstance::as_ref(instance) };
-    match env.new_global_ref(surface) {
-        Ok(surface) => native_instance.signal_event(ActivityEvent::SurfaceCreated(surface)),
-        Err(e) => crate::error!("On surfaceCreated handler: {e}"),
+    debug_assert_ne!(ptr, 0);
+    let instance = unsafe { NativeLibManager::as_ref(ptr) };
+    let surface = match env.new_global_ref(surface) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::error!("Error creating global ref: {e}");
+            return;
+        }
+    };
+    instance.signal_event(MediaPlayerEvent::SurfaceCreated(surface));
+}
+
+#[export_name = "Java_com_debug_myapplication_NativeLibSingleton_destroySurface"]
+pub extern "system" fn destroy_surface(
+    _env: JNIEnv,
+    _singleton: jni::sys::jobject,
+    ptr: jni::sys::jlong,
+) {
+    debug_assert_ne!(ptr, 0);
+    let instance = unsafe { NativeLibManager::as_ref(ptr) };
+    instance.signal_event(MediaPlayerEvent::SurfaceDestroyed);
+}
+
+#[export_name = "Java_com_debug_myapplication_NativeLibSingleton_startMediaPlayer"]
+pub extern "system" fn start_media_player(
+    env: JNIEnv,
+    singleton: jni::sys::jobject,
+    ptr: jni::sys::jlong,
+) {
+    debug_assert_ne!(ptr, 0);
+    let instance = unsafe { NativeLibManager::as_ref(ptr) };
+
+    let vm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(e) => {
+            crate::error!("{e}");
+            return;
+        }
+    };
+    let singleton = match env.new_global_ref(singleton) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::error!("{e}");
+            return;
+        }
+    };
+
+    instance.spawn_media_player(vm, singleton, test_decode);
+}
+
+pub fn set_media_player_aspect_ratio(
+    env: &JNIEnv,
+    singleton: &GlobalRef,
+    width: i32,
+    height: i32,
+) -> Result<(), jni::errors::Error> {
+    // Reduce the given width:height ratio to an irreducible fraction.
+    let (width, height) = {
+        let divisor = crate::util::gcd(width, height);
+        (width / divisor, height / divisor)
+    };
+
+    env.call_method(
+        singleton.as_obj(),
+        "setMediaPlayerAspectRatio",
+        "(II)V",
+        &[width.into(), height.into()],
+    )?;
+    Ok(())
+}
+
+async fn test_decode(
+    vm: JavaVM,
+    singleton: GlobalRef,
+    receiver: broadcast::Receiver<MediaPlayerEvent>,
+) {
+    if let Err(e) = run_decoder(vm, singleton, receiver).await {
+        println!("{e}");
     }
 }
 
-/// `surfaceDestroyed` handler.
-#[export_name = "Java_com_debug_myapplication_StreamingActivity_d"]
-pub extern "system" fn surface_destroyed(
-    _env: JNIEnv,
-    _activity: jni::sys::jobject,
-    instance: jni::sys::jlong,
-) {
-    let native_instance = unsafe { NativeInstance::as_ref(instance) };
-    native_instance.signal_event(ActivityEvent::SurfaceDestroyed);
-}
 
-fn dummy_loop(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<ActivityEvent>,
-    _activity: AndroidActivity,
-) {
-    crate::info!("dummy_loop");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Unable to create tokio runtime");
-    runtime.block_on(async move {
-        while let Some(msg) = receiver.recv().await {
-            crate::info!("Message: {msg:?}");
-            match msg {
-                ActivityEvent::Create => (),
-                ActivityEvent::Destroy => break,
-                ActivityEvent::SurfaceCreated(_) => (),
-                ActivityEvent::SurfaceDestroyed => (),
-            }
+async fn run_decoder(
+    vm: JavaVM,
+    singleton: GlobalRef,
+    mut receiver: broadcast::Receiver<MediaPlayerEvent>,
+) -> anyhow::Result<()> {
+    loop {
+        match receiver.recv().await {
+            Ok(msg) => match msg {
+                MediaPlayerEvent::SurfaceCreated(java_surface) => {
+                    let env = vm.attach_current_thread()?;
+
+                    let native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Unable to acquire an `ANativeWindow`")
+                        })?;
+
+                    let width = 1920;
+                    let height = 1080;
+                    let decoder = media::MediaCodec::create_video_decoder(
+                        &native_window,
+                        media::VideoType::H264,
+                        width,
+                        height,
+                        60,
+                        debug::CSD,
+                    )?;
+                    crate::info!("created decoder");
+
+                    set_media_player_aspect_ratio(&env, &singleton, width, height)?;
+                    decoder.set_output_surface(&native_window)?;
+
+                    crate::info!("starting decoder");
+
+                    let mut time = 0;
+
+                    let dur = std::time::Duration::from_micros(16_666);
+
+                    for packet_index in 0..119 {
+                        crate::info!("decode: {packet_index}");
+                        if decoder.try_decode(
+                            debug::PACKETS[packet_index],
+                            time,
+                            false,
+                        )? {
+                            time += 16_666;
+                            decoder.try_render()?;
+                            std::thread::sleep(dur);
+                        }
+                    }
+                    if decoder.try_decode(
+                        debug::PACKETS[119],
+                        time,
+                        true,
+                    )? {
+                        decoder.try_render()?;
+                    }
+                }
+                msg => anyhow::bail!("Unexpected message while waiting for a surface: {msg:?}"),
+            },
+            Err(e) => anyhow::bail!("Channel closed: {e}"),
         }
-    });
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
 }
-
-// fn decode_loop(
-//     event_receiver: crossbeam_channel::Receiver<ActivityEvent>,
-//     activity: AndroidActivity,
-// ) -> anyhow::Result<()> {
-//     let env = activity.vm.attach_current_thread()?;
-
-//     let java_surface = loop {
-//         match event_receiver.recv() {
-//             Ok(msg) => match msg {
-//                 ActivityEvent::Create => {
-//                     anyhow::bail!("Unexpected state change while waiting for a `Surface`")
-//                 }
-//                 ActivityEvent::SurfaceCreated(java_surface) => break java_surface,
-//                 _ => anyhow::bail!("Received exit message before receiving a `Surface`"),
-//             },
-//             Err(_) => anyhow::bail!("Error in event channel while waiting for a `Surface`"),
-//         }
-//     };
-
-//     let mut native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
-//         .ok_or_else(|| anyhow::anyhow!("Unable to acquire an `ANativeWindow`"))?;
-
-//     let width = 1920;
-//     let height = 1080;
-//     let decoder = media::MediaCodec::create_video_decoder(
-//         &native_window,
-//         media::VideoType::H264,
-//         width,
-//         height,
-//         60,
-//         debug::CSD,
-//     )?;
-//     info!("created decoder");
-
-//     let aspect_ratio_string = env.new_string(media::aspect_ratio_string(width, height))?;
-//     let obj = activity.activity_obj.as_obj();
-//     env.call_method(
-//         obj,
-//         "setSurfaceViewAspectRatio",
-//         "(Ljava/lang/String;)V",
-//         &[aspect_ratio_string.into()],
-//     )?;
-
-//     let mut time = 0;
-//     let mut packet_index = 0;
-
-//     loop {
-//         loop {
-//             match event_receiver.try_recv() {
-//                 Ok(msg) => {
-//                     match msg {
-//                         ActivityEvent::Create => {
-//                             anyhow::bail!("Unexpected state change to `OnCreate` while inside the decoding loop")
-//                         }
-//                         ActivityEvent::Destroy => {
-//                             info!("`Destroy` was signaled before `SurfaceDestroyed`")
-//                         }
-//                         ActivityEvent::SurfaceCreated(_java_surface) => {
-//                             anyhow::bail!("Surface was re-created while inside the decoding loop")
-//                         }
-//                         ActivityEvent::SurfaceDestroyed => break,
-//                     }
-//                 }
-//                 Err(e) => match e {
-//                     crossbeam_channel::TryRecvError::Empty => {
-//                         if packet_index < 120 {
-//                             let end_of_stream = if packet_index == 119 { true } else { false };
-//                             if decoder.try_decode(
-//                                 debug::PACKETS[packet_index],
-//                                 time,
-//                                 end_of_stream,
-//                             )? {
-//                                 time += 16_666;
-//                                 packet_index += 1;
-//                             }
-//                         }
-//                         decoder.try_render()?;
-//                     }
-//                     crossbeam_channel::TryRecvError::Disconnected => {
-//                         anyhow::bail!("Event channel was improperly dropped")
-//                     }
-//                 },
-//             };
-//         }
-
-//         // Wait for `OnCreate` or `OnDestroy` event from Java side
-//         loop {
-//             match event_receiver.recv() {
-//                 // Continue from `OnPause` or `OnStop`
-//                 Ok(ActivityEvent::Create) => {
-//                     // Wait for a new surface to be created
-//                     if let Ok(ActivityEvent::SurfaceCreated(java_surface)) = event_receiver.recv() {
-//                         native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
-//                             .ok_or_else(|| {
-//                                 anyhow::anyhow!("Unable to acquire an `ANativeWindow`")
-//                             })?;
-//                         decoder.set_output_surface(&native_window)?;
-//                     }
-//                 }
-//                 // App is being terminated
-//                 Ok(ActivityEvent::Destroy) => return Ok(()),
-//                 Ok(_) => anyhow::bail!("Unexpected state change while waiting for `Create` signal"),
-//                 Err(_) => anyhow::bail!("Event channel was improperly dropped"),
-//             }
-//         }
-//     }
-// }

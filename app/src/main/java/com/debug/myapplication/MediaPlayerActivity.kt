@@ -44,5 +44,4 @@ class MediaPlayerActivity : AppCompatActivity() {
             layoutConstraints.applyTo(binding.root)
         }
     }
-
 }
