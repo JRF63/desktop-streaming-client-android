@@ -1,7 +1,7 @@
 mod debug;
-mod decoder;
 mod log;
 mod media;
+mod network;
 mod util;
 mod window;
 
@@ -232,7 +232,7 @@ async fn run_decoder(
                     format.set_mime_type(media::VideoType::H264);
                     format.set_realtime_priority(true);
 
-                    let mut decoder = media::MediaCodec::new(media::VideoType::H264)?;
+                    let mut decoder = media::MediaCodec::new_decoder(media::VideoType::H264)?;
                     decoder.initialize(&format, Some(native_window), false)?;
 
                     crate::info!("created decoder");
@@ -257,7 +257,7 @@ async fn run_decoder(
                             (min_len, time)
                         })?;
                         time += FRAME_INTERVAL_MICROS;
-                        decoder.try_render()?;
+                        decoder.render_output()?;
                         std::thread::sleep(dur);
                     }
                     decoder.decode(|buffer| {
@@ -266,7 +266,7 @@ async fn run_decoder(
                         buffer[..min_len].copy_from_slice(&data[..min_len]);
                         (min_len, time)
                     })?;
-                    decoder.try_render()?;
+                    decoder.render_output()?;
                 }
                 msg => anyhow::bail!("Unexpected message while waiting for a surface: {msg:?}"),
             },

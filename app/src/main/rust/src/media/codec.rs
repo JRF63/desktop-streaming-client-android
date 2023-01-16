@@ -40,8 +40,8 @@ impl Drop for MediaCodec {
 }
 
 impl MediaCodec {
-    /// Create a new `MediaCodec`.
-    pub fn new<T>(kind: T) -> Result<MediaCodec, MediaStatus>
+    /// Create a decoder.
+    pub fn new_decoder<T>(kind: T) -> Result<MediaCodec, MediaStatus>
     where
         T: MediaFormatMimeType,
     {
@@ -59,7 +59,7 @@ impl MediaCodec {
     }
 
     /// Initializes using the given format then start the `MediaCodec`.
-    /// 
+    ///
     /// This is a combination of the configure and start steps.
     pub fn initialize(
         &mut self,
@@ -177,21 +177,8 @@ impl MediaCodec {
         }
     }
 
-    /// Get the index of the next available buffer of processed data.
-    fn dequeue_output_buffer(
-        &self,
-        buffer_info: *mut AMediaCodecBufferInfo,
-        timeout_micros: i64,
-    ) -> c_long {
-        unsafe { AMediaCodec_dequeueOutputBuffer(self.as_inner(), buffer_info, timeout_micros) }
-    }
-
-    /// Return the buffer to the codec.
-    fn release_output_buffer(&self, index: c_ulong, render: bool) -> Result<(), MediaStatus> {
-        unsafe { AMediaCodec_releaseOutputBuffer(self.as_inner(), index, render).success() }
-    }
-
-    pub(crate) fn try_render(&self) -> Result<(), MediaStatus> {
+    /// Renders the decoder output to the surface.
+    pub fn render_output(&self) -> Result<(), MediaStatus> {
         const TRY_AGAIN_LATER: c_long = AMEDIACODEC_INFO_TRY_AGAIN_LATER as c_long;
         const OUTPUT_FORMAT_CHANGED: c_long = AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as c_long;
         const OUTPUT_BUFFERS_CHANGED: c_long = AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED as c_long;
@@ -220,5 +207,19 @@ impl MediaCodec {
                 Ok(())
             }
         }
+    }
+
+    /// Get the index of the next available buffer of processed data.
+    fn dequeue_output_buffer(
+        &self,
+        buffer_info: *mut AMediaCodecBufferInfo,
+        timeout_micros: i64,
+    ) -> c_long {
+        unsafe { AMediaCodec_dequeueOutputBuffer(self.as_inner(), buffer_info, timeout_micros) }
+    }
+
+    /// Return the buffer to the codec.
+    fn release_output_buffer(&self, index: c_ulong, render: bool) -> Result<(), MediaStatus> {
+        unsafe { AMediaCodec_releaseOutputBuffer(self.as_inner(), index, render).success() }
     }
 }

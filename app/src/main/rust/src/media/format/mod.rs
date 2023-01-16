@@ -1,9 +1,10 @@
 mod video;
 
-use super::status::{AsMediaStatus, MediaStatus};
+pub use self::video::{H264Csd, HevcCsd, VideoType};
+use super::status::MediaStatus;
 use ndk_sys::{
-    AMediaFormat, AMediaFormat_delete, AMediaFormat_getString, AMediaFormat_new,
-    AMediaFormat_setBuffer, AMediaFormat_setInt32, AMediaFormat_setString, AMEDIAFORMAT_KEY_HEIGHT,
+    AMediaFormat, AMediaFormat_delete, AMediaFormat_new, AMediaFormat_setBuffer,
+    AMediaFormat_setInt32, AMediaFormat_setString, AMEDIAFORMAT_KEY_HEIGHT,
     AMEDIAFORMAT_KEY_MAX_HEIGHT, AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MIME,
     AMEDIAFORMAT_KEY_PRIORITY, AMEDIAFORMAT_KEY_WIDTH,
 };
@@ -11,7 +12,6 @@ use std::{
     ffi::{c_char, CStr},
     ptr::NonNull,
 };
-pub use self::video::{VideoType, H264Csd, HevcCsd};
 
 // Need to put the strings here because `AMEDIAFORMAT_KEY_CSD_0` and `AMEDIAFORMAT_KEY_CSD_1`
 // only became available in API level 28.
@@ -102,15 +102,6 @@ impl MediaFormat {
         T: MediaFormatData,
     {
         data.add_to_media_format(self);
-    }
-
-    pub(crate) fn get_mime_type(&self) -> *const c_char {
-        unsafe {
-            // Resulting string is owned by the `AMediaFormat`
-            let mut cstr: *const c_char = std::ptr::null();
-            AMediaFormat_getString(self.as_inner(), AMEDIAFORMAT_KEY_MIME, &mut cstr);
-            cstr
-        }
     }
 }
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Suppress warnings for now
+
 use super::{
     MediaFormat, MediaFormatData, MediaFormatMimeType, H264_MIME_TYPE, HEVC_MIME_TYPE,
     MEDIAFORMAT_KEY_CSD_0, MEDIAFORMAT_KEY_CSD_1,
@@ -16,7 +18,7 @@ impl MediaFormatMimeType for VideoType {
             VideoType::H264 => H264_MIME_TYPE,
             VideoType::Hevc => HEVC_MIME_TYPE,
         };
-        unsafe { CStr::from_ptr(s.as_ptr()) }
+        unsafe { CStr::from_ptr(s.as_ptr().cast()) }
     }
 }
 
@@ -29,9 +31,8 @@ fn nal_boundaries(data: &[u8]) -> Vec<usize> {
         match byte {
             0 => zeroes += 1,
             1 => {
-                // FIXME: [0x0, 0x0, 0x1] is valid too.
-                if zeroes == 3 {
-                    boundaries.push(i - 3);
+                if zeroes >= 2 {
+                    boundaries.push(i - zeroes);
                 }
                 zeroes = 0;
             }
