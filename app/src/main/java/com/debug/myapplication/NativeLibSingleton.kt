@@ -48,7 +48,15 @@ object NativeLibSingleton {
     }
 
     // Called by native code
-    fun setMediaPlayerAspectRatio(width: Int, height: Int) {
+    private fun setMediaPlayerAspectRatio(width: Int, height: Int) {
         mediaPlayerActivity?.setSurfaceViewAspectRatio(width, height)
+    }
+
+    fun chooseDecoderForType(mimeType: String): String? {
+        return CodecQuerySingleton.chooseDecoderForType(mimeType)
+    }
+
+    fun listProfilesForDecoder(decoderName: String, mimeType: String): IntArray? {
+        return CodecQuerySingleton.listProfilesForDecoder(decoderName, mimeType)?.toIntArray()
     }
 }

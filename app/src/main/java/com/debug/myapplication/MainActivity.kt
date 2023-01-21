@@ -27,22 +27,12 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, MediaPlayerActivity::class.java)
         startActivity(intent)
 
-//        listDecoders("video/avc")
-//        listDecoders("video/hevc")
-    }
-
-//    private fun listDecoders(mimeType: String) {
-//        val decoders =
-//            MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.filter { !it.isEncoder }.filter {
-//                it.supportedTypes.any { type -> type.equals(mimeType, ignoreCase = true) }
-//            }
-//        Log.i("client-android", mimeType)
-//        for (codecInfo in decoders) {
-//            Log.i("client-android", "  ${codecInfo.name}")
-//            val capabilities = codecInfo.getCapabilitiesForType(mimeType)
-//            for (profile in capabilities.profileLevels) {
-//                Log.i("client-android", "    ${profile.profile}, ${profile.level}")
-//            }
+//        val mimeType = "video/avc"
+//        val decoder = NativeLibSingleton.chooseDecoderForType(mimeType)!!
+//        Log.i("client-android", decoder)
+//        val profiles = NativeLibSingleton.listProfilesForDecoder(decoder, mimeType)
+//        for (p in profiles!!) {
+//            Log.i("client-android", " $p")
 //        }
-//    }
+    }
 }

@@ -1,16 +1,19 @@
 mod debug;
 mod log;
 mod media;
-mod network;
 mod util;
+mod webrtc;
 mod window;
 
 // adb logcat -v raw -s client-android
 // C:\Users\Rafael\AppData\Local\Android\Sdk\emulator\emulator -avd Pixel_3_XL_API_31
 // gradlew installX86_64Debug
 
-use jni::{objects::GlobalRef, JNIEnv, JavaVM};
-use std::future::Future;
+use jni::{
+    objects::{GlobalRef, JObject, JString, JValue, ReleaseMode},
+    JNIEnv, JavaVM,
+};
+use std::{future::Future, sync::Arc};
 use tokio::{
     runtime::{self, Runtime},
     sync::broadcast,
@@ -39,20 +42,27 @@ impl std::fmt::Debug for MediaPlayerEvent {
 
 /// Thread pool that runs the native code.
 pub struct NativeLibManager {
-    sender: broadcast::Sender<MediaPlayerEvent>,
+    vm: JavaVM,
+    singleton: GlobalRef,
     runtime: Runtime,
+    sender: broadcast::Sender<MediaPlayerEvent>,
 }
 
 impl NativeLibManager {
     /// Create a `NativeLibManager`.
-    pub fn new() -> Result<NativeLibManager, std::io::Error> {
+    pub fn new(vm: JavaVM, singleton: GlobalRef) -> Result<NativeLibManager, std::io::Error> {
         let runtime = runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(RUNTIME_WORKER_THREADS)
             .build()?;
         let (sender, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
-        Ok(NativeLibManager { sender, runtime })
+        Ok(NativeLibManager {
+            vm,
+            singleton,
+            runtime,
+            sender,
+        })
     }
 
     /// Signal an `ActivityEvent`.
@@ -62,16 +72,16 @@ impl NativeLibManager {
         }
     }
 
-    /// Reinterpret a [Box] as a 64-bit integer which can be stored in Kotlin/Java.
-    pub fn into_java_long(self: Box<NativeLibManager>) -> jni::sys::jlong {
-        let leaked_ptr = Box::into_raw(self);
+    /// Reinterpret a [Arc] as a 64-bit integer which can be stored in Kotlin/Java.
+    pub fn into_java_long(self: Arc<NativeLibManager>) -> jni::sys::jlong {
+        let leaked_ptr = Arc::into_raw(self);
         leaked_ptr as usize as jni::sys::jlong
     }
 
     /// Convert a previously stored integer back into a `NativeLibManager`. The value of `instance`
     /// is no longer valid after this call.
-    pub unsafe fn from_raw_integer(instance: jni::sys::jlong) -> Box<NativeLibManager> {
-        Box::from_raw(instance as usize as *mut NativeLibManager)
+    pub unsafe fn from_raw_integer(instance: jni::sys::jlong) -> Arc<NativeLibManager> {
+        Arc::from_raw(instance as usize as *mut NativeLibManager)
     }
 
     /// Reinterpret an integer as a reference to a `NativeLibManager` without taking ownership.
@@ -79,25 +89,121 @@ impl NativeLibManager {
         &*(instance as usize as *const NativeLibManager)
     }
 
-    pub fn spawn_media_player<T, F>(&self, vm: JavaVM, singleton: GlobalRef, func: T)
+    pub fn spawn_media_player<T, F>(self: &Arc<NativeLibManager>, func: T)
     where
-        T: FnOnce(JavaVM, GlobalRef, broadcast::Receiver<MediaPlayerEvent>) -> F,
+        T: FnOnce(Arc<NativeLibManager>) -> F,
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let receiver = self.sender.subscribe();
-        self.runtime.spawn(func(vm, singleton, receiver));
+        self.runtime.spawn(func(self.clone()));
+    }
+
+    pub fn get_event_receiver(&self) -> broadcast::Receiver<MediaPlayerEvent> {
+        self.sender.subscribe()
+    }
+
+    /// Call the singleton method to set the aspect ratio of the player.
+    pub fn set_media_player_aspect_ratio(
+        &self,
+        env: &JNIEnv,
+        width: i32,
+        height: i32,
+    ) -> Result<(), jni::errors::Error> {
+        // Reduce the given width:height ratio to its lowest terms.
+        let (width, height) = {
+            let divisor = crate::util::gcd(width, height);
+            (width / divisor, height / divisor)
+        };
+
+        env.call_method(
+            self.singleton.as_obj(),
+            "setMediaPlayerAspectRatio",
+            "(II)V",
+            &[width.into(), height.into()],
+        )?;
+        Ok(())
+    }
+
+    pub fn choose_decoder_for_type(
+        &self,
+        env: &JNIEnv,
+        mime_type: &str,
+    ) -> Result<String, jni::errors::Error> {
+        let mime_type = env.new_string(mime_type)?;
+        let method_output = env.call_method(
+            self.singleton.as_obj(),
+            "chooseDecoderForType",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[mime_type.into()],
+        )?;
+
+        let JValue::Object(obj) = method_output else {
+            return Err(jni::errors::Error::JavaException);
+        };
+
+        let jstring = JString::from(obj);
+        let java_str = env.get_string(jstring)?;
+        let s = java_str
+            .to_str()
+            .map_err(|_| jni::errors::Error::JavaException)?;
+        Ok(s.to_owned())
+    }
+
+    pub fn list_profile_levels_for_decoder(
+        &self,
+        env: &JNIEnv,
+        decoder_name: &str,
+        mime_type: &str,
+    ) -> Result<Vec<i32>, jni::errors::Error> {
+        let decoder_name = env.new_string(decoder_name)?;
+        let mime_type = env.new_string(mime_type)?;
+        let method_output = env.call_method(
+            self.singleton.as_obj(),
+            "listProfilesForDecoder",
+            "(Ljava/lang/String;Ljava/lang/String;)[I",
+            &[decoder_name.into(), mime_type.into()],
+        )?;
+        let JValue::Object(obj) = method_output else {
+            return Err(jni::errors::Error::JavaException);
+        };
+        let array = env.get_int_array_elements(obj.into_raw(), ReleaseMode::NoCopyBack)?;
+        let array_len = array.size()? as usize;
+        let mut profiles = Vec::with_capacity(array_len);
+
+        let ptr = array.as_ptr();
+        for i in 0..array_len {
+            profiles.push(unsafe { *ptr.offset(i as isize) });
+        }
+        Ok(profiles)
     }
 }
 
 /// Initializes the native library.
 #[export_name = "Java_com_debug_myapplication_NativeLibSingleton_createNativeInstance"]
 pub extern "system" fn create_native_instance(
-    _env: JNIEnv,
-    _singleton: jni::sys::jobject,
+    env: JNIEnv,
+    singleton: jni::sys::jobject,
 ) -> jni::sys::jlong {
-    match NativeLibManager::new() {
-        Ok(instance) => Box::new(instance).into_java_long(),
+    let vm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(e) => {
+            crate::error!("{e}");
+            return 0;
+        }
+    };
+
+    debug_assert!(!singleton.is_null());
+    let singleton = unsafe { JObject::from_raw(singleton) };
+    let singleton = match env.new_global_ref(singleton) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::error!("{e}");
+            return 0;
+        }
+    };
+
+    match NativeLibManager::new(vm, singleton) {
+        Ok(instance) => Arc::new(instance).into_java_long(),
         Err(e) => {
             crate::error!("Error creating native instance: {e}");
             0
@@ -113,10 +219,9 @@ pub extern "system" fn destroy_native_instance(
     ptr: jni::sys::jlong,
 ) {
     debug_assert_ne!(ptr, 0);
-    let boxed = unsafe { NativeLibManager::from_raw_integer(ptr) };
-    boxed.signal_event(MediaPlayerEvent::MainActivityDestroyed);
-    let instance = *boxed;
-    instance.runtime.shutdown_background();
+    let arc = unsafe { NativeLibManager::from_raw_integer(ptr) };
+    arc.signal_event(MediaPlayerEvent::MainActivityDestroyed);
+    std::mem::drop(arc); // Unnecessary but emphasizes that it will be dropped and freed
 }
 
 #[export_name = "Java_com_debug_myapplication_NativeLibSingleton_sendSurface"]
@@ -128,6 +233,9 @@ pub extern "system" fn send_surface(
 ) {
     debug_assert_ne!(ptr, 0);
     let instance = unsafe { NativeLibManager::as_ref(ptr) };
+
+    debug_assert!(!surface.is_null());
+    let surface = unsafe { JObject::from_raw(surface) };
     let surface = match env.new_global_ref(surface) {
         Ok(s) => s,
         Err(e) => {
@@ -151,72 +259,50 @@ pub extern "system" fn destroy_surface(
 
 #[export_name = "Java_com_debug_myapplication_NativeLibSingleton_startMediaPlayer"]
 pub extern "system" fn start_media_player(
-    env: JNIEnv,
-    singleton: jni::sys::jobject,
+    _env: JNIEnv,
+    _singleton: jni::sys::jobject,
     ptr: jni::sys::jlong,
 ) {
     debug_assert_ne!(ptr, 0);
-    let instance = unsafe { NativeLibManager::as_ref(ptr) };
 
-    let vm = match env.get_java_vm() {
-        Ok(vm) => vm,
-        Err(e) => {
-            crate::error!("{e}");
-            return;
-        }
-    };
-    let singleton = match env.new_global_ref(singleton) {
-        Ok(s) => s,
-        Err(e) => {
-            crate::error!("{e}");
-            return;
-        }
-    };
-
-    instance.spawn_media_player(vm, singleton, test_decode);
+    let arc = unsafe { NativeLibManager::from_raw_integer(ptr) };
+    arc.spawn_media_player(test_decode);
+    arc.into_java_long(); // Prevent the `Arc` from being dropped
 }
 
-pub fn set_media_player_aspect_ratio(
-    env: &JNIEnv,
-    singleton: &GlobalRef,
-    width: i32,
-    height: i32,
-) -> Result<(), jni::errors::Error> {
-    // Reduce the given width:height ratio to an irreducible fraction.
-    let (width, height) = {
-        let divisor = crate::util::gcd(width, height);
-        (width / divisor, height / divisor)
-    };
-
-    env.call_method(
-        singleton.as_obj(),
-        "setMediaPlayerAspectRatio",
-        "(II)V",
-        &[width.into(), height.into()],
-    )?;
-    Ok(())
-}
-
-async fn test_decode(
-    vm: JavaVM,
-    singleton: GlobalRef,
-    receiver: broadcast::Receiver<MediaPlayerEvent>,
-) {
-    if let Err(e) = run_decoder(vm, singleton, receiver).await {
+async fn test_decode(manager: Arc<NativeLibManager>) {
+    if let Err(e) = run_decoder(manager).await {
         println!("{e}");
     }
 }
 
 async fn run_decoder(
-    vm: JavaVM,
-    singleton: GlobalRef,
-    mut receiver: broadcast::Receiver<MediaPlayerEvent>,
+    // vm: JavaVM,
+    // singleton: GlobalRef,
+    // mut receiver: broadcast::Receiver<MediaPlayerEvent>,
+    manager: Arc<NativeLibManager>,
 ) -> anyhow::Result<()> {
+    let mut receiver = manager.get_event_receiver();
     loop {
         match receiver.recv().await {
             Ok(msg) => match msg {
                 MediaPlayerEvent::SurfaceCreated(java_surface) => {
-                    let env = vm.attach_current_thread()?;
+                    let env = manager.vm.attach_current_thread()?;
+
+                    match manager.choose_decoder_for_type(&env, "video/avc") {
+                        Ok(s) => {
+                            crate::info!("Chosen decoder for video/avc: {s}");
+                            match manager.list_profile_levels_for_decoder(&env, &s, "video/avc") {
+                                Ok(profiles) => {
+                                    for i in profiles {
+                                        crate::info!("  {i}");
+                                    }
+                                }
+                                Err(e) => crate::error!("Failed to list profiles: {e}"),
+                            }
+                        }
+                        Err(_) => crate::error!("Failed to choose decoder"),
+                    }
 
                     let native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
                         .ok_or_else(|| anyhow::anyhow!("Unable to acquire a `ANativeWindow`"))?;
@@ -224,7 +310,7 @@ async fn run_decoder(
                     let width = 1920;
                     let height = 1080;
 
-                    set_media_player_aspect_ratio(&env, &singleton, width, height)?;
+                    manager.set_media_player_aspect_ratio(&env, width, height)?;
 
                     let mut format = media::MediaFormat::new()?;
                     format.set_resolution(width, height);

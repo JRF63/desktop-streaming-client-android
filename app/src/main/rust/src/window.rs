@@ -18,7 +18,7 @@ impl NativeWindow {
     /// Create a `NativeWindow` from the surface received from the `surfaceCreated` event.
     pub fn new(env: &JNIEnv, surface: &JObject) -> Option<Self> {
         NonNull::new(unsafe {
-            ANativeWindow_fromSurface(env.get_native_interface(), surface.into_inner())
+            ANativeWindow_fromSurface(env.get_native_interface(), surface.into_raw())
         })
         .map(|ptr| NativeWindow(ptr))
     }
