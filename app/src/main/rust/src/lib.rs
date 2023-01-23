@@ -20,7 +20,7 @@ use tokio::{
 };
 
 pub const RUNTIME_WORKER_THREADS: usize = 2;
-pub const BROADCAST_CHANNEL_CAPACITY: usize = 8;
+pub const BROADCAST_CHANNEL_CAPACITY: usize = 4;
 
 /// Events that are of interest to the media player.
 #[derive(Clone)]
@@ -41,23 +41,23 @@ impl std::fmt::Debug for MediaPlayerEvent {
 }
 
 /// Thread pool that runs the native code.
-pub struct NativeLibManager {
+pub struct NativeLibSingleton {
     vm: JavaVM,
     singleton: GlobalRef,
     runtime: Runtime,
     sender: broadcast::Sender<MediaPlayerEvent>,
 }
 
-impl NativeLibManager {
+impl NativeLibSingleton {
     /// Create a `NativeLibManager`.
-    pub fn new(vm: JavaVM, singleton: GlobalRef) -> Result<NativeLibManager, std::io::Error> {
+    pub fn new(vm: JavaVM, singleton: GlobalRef) -> Result<NativeLibSingleton, std::io::Error> {
         let runtime = runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(RUNTIME_WORKER_THREADS)
             .build()?;
         let (sender, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
-        Ok(NativeLibManager {
+        Ok(NativeLibSingleton {
             vm,
             singleton,
             runtime,
@@ -73,25 +73,30 @@ impl NativeLibManager {
     }
 
     /// Reinterpret a [Arc] as a 64-bit integer which can be stored in Kotlin/Java.
-    pub fn into_java_long(self: Arc<NativeLibManager>) -> jni::sys::jlong {
+    pub fn into_java_long(self: Arc<NativeLibSingleton>) -> jni::sys::jlong {
         let leaked_ptr = Arc::into_raw(self);
         leaked_ptr as usize as jni::sys::jlong
     }
 
     /// Convert a previously stored integer back into a `NativeLibManager`. The value of `instance`
     /// is no longer valid after this call.
-    pub unsafe fn from_raw_integer(instance: jni::sys::jlong) -> Arc<NativeLibManager> {
-        Arc::from_raw(instance as usize as *mut NativeLibManager)
+    pub unsafe fn from_raw_integer(instance: jni::sys::jlong) -> Arc<NativeLibSingleton> {
+        Arc::from_raw(instance as usize as *mut NativeLibSingleton)
     }
 
     /// Reinterpret an integer as a reference to a `NativeLibManager` without taking ownership.
     pub unsafe fn as_ref<'a>(instance: jni::sys::jlong) -> &'a Self {
-        &*(instance as usize as *const NativeLibManager)
+        &*(instance as usize as *const NativeLibSingleton)
     }
 
-    pub fn spawn_media_player<T, F>(self: &Arc<NativeLibManager>, func: T)
+    /// Returns the process-global Java VM.
+    pub fn global_vm(&self) -> &JavaVM {
+        &self.vm
+    }
+
+    pub fn spawn<T, F>(self: &Arc<NativeLibSingleton>, func: T)
     where
-        T: FnOnce(Arc<NativeLibManager>) -> F,
+        T: FnOnce(Arc<NativeLibSingleton>) -> F,
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
@@ -202,7 +207,7 @@ pub extern "system" fn create_native_instance(
         }
     };
 
-    match NativeLibManager::new(vm, singleton) {
+    match NativeLibSingleton::new(vm, singleton) {
         Ok(instance) => Arc::new(instance).into_java_long(),
         Err(e) => {
             crate::error!("Error creating native instance: {e}");
@@ -219,7 +224,7 @@ pub extern "system" fn destroy_native_instance(
     ptr: jni::sys::jlong,
 ) {
     debug_assert_ne!(ptr, 0);
-    let arc = unsafe { NativeLibManager::from_raw_integer(ptr) };
+    let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
     arc.signal_event(MediaPlayerEvent::MainActivityDestroyed);
     std::mem::drop(arc); // Unnecessary but emphasizes that it will be dropped and freed
 }
@@ -232,7 +237,7 @@ pub extern "system" fn send_surface(
     surface: jni::sys::jobject,
 ) {
     debug_assert_ne!(ptr, 0);
-    let instance = unsafe { NativeLibManager::as_ref(ptr) };
+    let instance = unsafe { NativeLibSingleton::as_ref(ptr) };
 
     debug_assert!(!surface.is_null());
     let surface = unsafe { JObject::from_raw(surface) };
@@ -253,7 +258,7 @@ pub extern "system" fn destroy_surface(
     ptr: jni::sys::jlong,
 ) {
     debug_assert_ne!(ptr, 0);
-    let instance = unsafe { NativeLibManager::as_ref(ptr) };
+    let instance = unsafe { NativeLibSingleton::as_ref(ptr) };
     instance.signal_event(MediaPlayerEvent::SurfaceDestroyed);
 }
 
@@ -265,101 +270,101 @@ pub extern "system" fn start_media_player(
 ) {
     debug_assert_ne!(ptr, 0);
 
-    let arc = unsafe { NativeLibManager::from_raw_integer(ptr) };
-    arc.spawn_media_player(test_decode);
+    let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
+    arc.spawn(webrtc::start_webrtc);
     arc.into_java_long(); // Prevent the `Arc` from being dropped
 }
 
-async fn test_decode(manager: Arc<NativeLibManager>) {
-    if let Err(e) = run_decoder(manager).await {
-        println!("{e}");
-    }
-}
+// async fn test_decode(manager: Arc<NativeLibSingleton>) {
+//     if let Err(e) = run_decoder(manager).await {
+//         println!("{e}");
+//     }
+// }
 
-async fn run_decoder(
-    // vm: JavaVM,
-    // singleton: GlobalRef,
-    // mut receiver: broadcast::Receiver<MediaPlayerEvent>,
-    manager: Arc<NativeLibManager>,
-) -> anyhow::Result<()> {
-    let mut receiver = manager.get_event_receiver();
-    loop {
-        match receiver.recv().await {
-            Ok(msg) => match msg {
-                MediaPlayerEvent::SurfaceCreated(java_surface) => {
-                    let env = manager.vm.attach_current_thread()?;
+// async fn run_decoder(
+//     // vm: JavaVM,
+//     // singleton: GlobalRef,
+//     // mut receiver: broadcast::Receiver<MediaPlayerEvent>,
+//     manager: Arc<NativeLibSingleton>,
+// ) -> anyhow::Result<()> {
+//     let mut receiver = manager.get_event_receiver();
+//     loop {
+//         match receiver.recv().await {
+//             Ok(msg) => match msg {
+//                 MediaPlayerEvent::SurfaceCreated(java_surface) => {
+//                     let env = manager.vm.attach_current_thread()?;
 
-                    match manager.choose_decoder_for_type(&env, "video/avc") {
-                        Ok(s) => {
-                            crate::info!("Chosen decoder for video/avc: {s}");
-                            match manager.list_profile_levels_for_decoder(&env, &s, "video/avc") {
-                                Ok(profiles) => {
-                                    for i in profiles {
-                                        crate::info!("  {i}");
-                                    }
-                                }
-                                Err(e) => crate::error!("Failed to list profiles: {e}"),
-                            }
-                        }
-                        Err(_) => crate::error!("Failed to choose decoder"),
-                    }
+//                     match manager.choose_decoder_for_type(&env, "video/avc") {
+//                         Ok(s) => {
+//                             crate::info!("Chosen decoder for video/avc: {s}");
+//                             match manager.list_profile_levels_for_decoder(&env, &s, "video/avc") {
+//                                 Ok(profiles) => {
+//                                     for i in profiles {
+//                                         crate::info!("  {i}");
+//                                     }
+//                                 }
+//                                 Err(e) => crate::error!("Failed to list profiles: {e}"),
+//                             }
+//                         }
+//                         Err(_) => crate::error!("Failed to choose decoder"),
+//                     }
 
-                    let native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
-                        .ok_or_else(|| anyhow::anyhow!("Unable to acquire a `ANativeWindow`"))?;
+//                     let native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
+//                         .ok_or_else(|| anyhow::anyhow!("Unable to acquire a `ANativeWindow`"))?;
 
-                    let width = 1920;
-                    let height = 1080;
+//                     let width = 1920;
+//                     let height = 1080;
 
-                    manager.set_media_player_aspect_ratio(&env, width, height)?;
+//                     manager.set_media_player_aspect_ratio(&env, width, height)?;
 
-                    let mut format = media::MediaFormat::new()?;
-                    format.set_resolution(width, height);
-                    format.set_max_resolution(width, height);
-                    format.set_mime_type(media::VideoType::H264);
-                    format.set_realtime_priority(true);
+//                     let mut format = media::MediaFormat::new()?;
+//                     format.set_resolution(width, height);
+//                     format.set_max_resolution(width, height);
+//                     format.set_mime_type(media::VideoType::H264);
+//                     format.set_realtime_priority(true);
 
-                    let mut decoder = media::MediaCodec::new_decoder(media::VideoType::H264)?;
-                    decoder.initialize(&format, Some(native_window), false)?;
+//                     let mut decoder = media::MediaCodec::new_decoder(media::VideoType::H264)?;
+//                     decoder.initialize(&format, Some(native_window), false)?;
 
-                    crate::info!("created decoder");
+//                     crate::info!("created decoder");
 
-                    const FRAME_INTERVAL_MICROS: u64 = 16_666;
-                    let dur = std::time::Duration::from_micros(FRAME_INTERVAL_MICROS);
-                    let mut time = 0;
+//                     const FRAME_INTERVAL_MICROS: u64 = 16_666;
+//                     let dur = std::time::Duration::from_micros(FRAME_INTERVAL_MICROS);
+//                     let mut time = 0;
 
-                    decoder.submit_codec_config(|buffer| {
-                        let data = debug::CSD;
-                        let min_len = data.len().min(buffer.len());
-                        buffer[..min_len].copy_from_slice(&data[..min_len]);
-                        (min_len, 0)
-                    })?;
+//                     decoder.submit_codec_config(|buffer| {
+//                         let data = debug::CSD;
+//                         let min_len = data.len().min(buffer.len());
+//                         buffer[..min_len].copy_from_slice(&data[..min_len]);
+//                         (min_len, 0)
+//                     })?;
 
-                    for packet_index in 0..119 {
-                        crate::info!("decode: {packet_index}");
-                        decoder.decode(|buffer| {
-                            let data = debug::PACKETS[packet_index];
-                            let min_len = data.len().min(buffer.len());
-                            buffer[..min_len].copy_from_slice(&data[..min_len]);
-                            (min_len, time)
-                        })?;
-                        time += FRAME_INTERVAL_MICROS;
-                        decoder.render_output()?;
-                        std::thread::sleep(dur);
-                    }
-                    decoder.decode(|buffer| {
-                        let data = debug::PACKETS[119];
-                        let min_len = data.len().min(buffer.len());
-                        buffer[..min_len].copy_from_slice(&data[..min_len]);
-                        (min_len, time)
-                    })?;
-                    decoder.render_output()?;
-                }
-                msg => anyhow::bail!("Unexpected message while waiting for a surface: {msg:?}"),
-            },
-            Err(e) => anyhow::bail!("Channel closed: {e}"),
-        }
-    }
+//                     for packet_index in 0..119 {
+//                         crate::info!("decode: {packet_index}");
+//                         decoder.decode(|buffer| {
+//                             let data = debug::PACKETS[packet_index];
+//                             let min_len = data.len().min(buffer.len());
+//                             buffer[..min_len].copy_from_slice(&data[..min_len]);
+//                             (min_len, time)
+//                         })?;
+//                         time += FRAME_INTERVAL_MICROS;
+//                         decoder.render_output()?;
+//                         std::thread::sleep(dur);
+//                     }
+//                     decoder.decode(|buffer| {
+//                         let data = debug::PACKETS[119];
+//                         let min_len = data.len().min(buffer.len());
+//                         buffer[..min_len].copy_from_slice(&data[..min_len]);
+//                         (min_len, time)
+//                     })?;
+//                     decoder.render_output()?;
+//                 }
+//                 msg => anyhow::bail!("Unexpected message while waiting for a surface: {msg:?}"),
+//             },
+//             Err(e) => anyhow::bail!("Channel closed: {e}"),
+//         }
+//     }
 
-    #[allow(unreachable_code)]
-    Ok(())
-}
+//     #[allow(unreachable_code)]
+//     Ok(())
+// }
