@@ -133,7 +133,7 @@ impl NativeLibSingleton {
         &self,
         env: &JNIEnv,
         mime_type: &str,
-    ) -> Result<String, jni::errors::Error> {
+    ) -> Result<Option<String>, jni::errors::Error> {
         let mime_type = env.new_string(mime_type)?;
         let method_output = env.call_method(
             self.singleton.as_obj(),
@@ -145,21 +145,24 @@ impl NativeLibSingleton {
         let JValue::Object(obj) = method_output else {
             return Err(jni::errors::Error::JavaException);
         };
+        if obj.into_raw().is_null() {
+            return Ok(None);
+        }
 
         let jstring = JString::from(obj);
         let java_str = env.get_string(jstring)?;
         let s = java_str
             .to_str()
             .map_err(|_| jni::errors::Error::JavaException)?;
-        Ok(s.to_owned())
+        Ok(Some(s.to_owned()))
     }
 
-    pub fn list_profile_levels_for_decoder(
+    pub fn list_profiles_for_decoder(
         &self,
         env: &JNIEnv,
         decoder_name: &str,
         mime_type: &str,
-    ) -> Result<Vec<i32>, jni::errors::Error> {
+    ) -> Result<Option<Vec<i32>>, jni::errors::Error> {
         let decoder_name = env.new_string(decoder_name)?;
         let mime_type = env.new_string(mime_type)?;
         let method_output = env.call_method(
@@ -168,9 +171,14 @@ impl NativeLibSingleton {
             "(Ljava/lang/String;Ljava/lang/String;)[I",
             &[decoder_name.into(), mime_type.into()],
         )?;
+
         let JValue::Object(obj) = method_output else {
             return Err(jni::errors::Error::JavaException);
         };
+        if obj.into_raw().is_null() {
+            return Ok(None);
+        }
+
         let array = env.get_int_array_elements(obj.into_raw(), ReleaseMode::NoCopyBack)?;
         let array_len = array.size()? as usize;
         let mut profiles = Vec::with_capacity(array_len);
@@ -179,7 +187,7 @@ impl NativeLibSingleton {
         for i in 0..array_len {
             profiles.push(unsafe { *ptr.offset(i as isize) });
         }
-        Ok(profiles)
+        Ok(Some(profiles))
     }
 }
 
@@ -223,10 +231,11 @@ pub extern "system" fn destroy_native_instance(
     _singleton: jni::sys::jobject,
     ptr: jni::sys::jlong,
 ) {
-    debug_assert_ne!(ptr, 0);
-    let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
-    arc.signal_event(MediaPlayerEvent::MainActivityDestroyed);
-    std::mem::drop(arc); // Unnecessary but emphasizes that it will be dropped and freed
+    if ptr != 0 {
+        let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
+        arc.signal_event(MediaPlayerEvent::MainActivityDestroyed);
+        std::mem::drop(arc); // Unnecessary but emphasizes that it will be dropped and freed
+    }
 }
 
 #[export_name = "Java_com_debug_myapplication_NativeLibSingleton_sendSurface"]
@@ -279,92 +288,4 @@ pub extern "system" fn start_media_player(
 //     if let Err(e) = run_decoder(manager).await {
 //         println!("{e}");
 //     }
-// }
-
-// async fn run_decoder(
-//     // vm: JavaVM,
-//     // singleton: GlobalRef,
-//     // mut receiver: broadcast::Receiver<MediaPlayerEvent>,
-//     manager: Arc<NativeLibSingleton>,
-// ) -> anyhow::Result<()> {
-//     let mut receiver = manager.get_event_receiver();
-//     loop {
-//         match receiver.recv().await {
-//             Ok(msg) => match msg {
-//                 MediaPlayerEvent::SurfaceCreated(java_surface) => {
-//                     let env = manager.vm.attach_current_thread()?;
-
-//                     match manager.choose_decoder_for_type(&env, "video/avc") {
-//                         Ok(s) => {
-//                             crate::info!("Chosen decoder for video/avc: {s}");
-//                             match manager.list_profile_levels_for_decoder(&env, &s, "video/avc") {
-//                                 Ok(profiles) => {
-//                                     for i in profiles {
-//                                         crate::info!("  {i}");
-//                                     }
-//                                 }
-//                                 Err(e) => crate::error!("Failed to list profiles: {e}"),
-//                             }
-//                         }
-//                         Err(_) => crate::error!("Failed to choose decoder"),
-//                     }
-
-//                     let native_window = window::NativeWindow::new(&env, &java_surface.as_obj())
-//                         .ok_or_else(|| anyhow::anyhow!("Unable to acquire a `ANativeWindow`"))?;
-
-//                     let width = 1920;
-//                     let height = 1080;
-
-//                     manager.set_media_player_aspect_ratio(&env, width, height)?;
-
-//                     let mut format = media::MediaFormat::new()?;
-//                     format.set_resolution(width, height);
-//                     format.set_max_resolution(width, height);
-//                     format.set_mime_type(media::VideoType::H264);
-//                     format.set_realtime_priority(true);
-
-//                     let mut decoder = media::MediaCodec::new_decoder(media::VideoType::H264)?;
-//                     decoder.initialize(&format, Some(native_window), false)?;
-
-//                     crate::info!("created decoder");
-
-//                     const FRAME_INTERVAL_MICROS: u64 = 16_666;
-//                     let dur = std::time::Duration::from_micros(FRAME_INTERVAL_MICROS);
-//                     let mut time = 0;
-
-//                     decoder.submit_codec_config(|buffer| {
-//                         let data = debug::CSD;
-//                         let min_len = data.len().min(buffer.len());
-//                         buffer[..min_len].copy_from_slice(&data[..min_len]);
-//                         (min_len, 0)
-//                     })?;
-
-//                     for packet_index in 0..119 {
-//                         crate::info!("decode: {packet_index}");
-//                         decoder.decode(|buffer| {
-//                             let data = debug::PACKETS[packet_index];
-//                             let min_len = data.len().min(buffer.len());
-//                             buffer[..min_len].copy_from_slice(&data[..min_len]);
-//                             (min_len, time)
-//                         })?;
-//                         time += FRAME_INTERVAL_MICROS;
-//                         decoder.render_output()?;
-//                         std::thread::sleep(dur);
-//                     }
-//                     decoder.decode(|buffer| {
-//                         let data = debug::PACKETS[119];
-//                         let min_len = data.len().min(buffer.len());
-//                         buffer[..min_len].copy_from_slice(&data[..min_len]);
-//                         (min_len, time)
-//                     })?;
-//                     decoder.render_output()?;
-//                 }
-//                 msg => anyhow::bail!("Unexpected message while waiting for a surface: {msg:?}"),
-//             },
-//             Err(e) => anyhow::bail!("Channel closed: {e}"),
-//         }
-//     }
-
-//     #[allow(unreachable_code)]
-//     Ok(())
 // }

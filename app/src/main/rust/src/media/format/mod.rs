@@ -18,8 +18,9 @@ use std::{
 const MEDIAFORMAT_KEY_CSD_0: &'static str = "csd-0\0";
 const MEDIAFORMAT_KEY_CSD_1: &'static str = "csd-1\0";
 
-const H264_MIME_TYPE: &'static str = "video/avc\0";
+const AV1_MIME_TYPE: &'static str = "video/av01\0";
 const HEVC_MIME_TYPE: &'static str = "video/hevc\0";
+const H264_MIME_TYPE: &'static str = "video/avc\0";
 
 /// RAII wrapper for [AMediaFormat].
 #[repr(transparent)]
@@ -32,6 +33,9 @@ impl Drop for MediaFormat {
         }
     }
 }
+
+// FIXME: Is this safe?
+unsafe impl Send for MediaFormat {}
 
 impl MediaFormat {
     /// Create a new `MediaFormat`.
@@ -115,4 +119,16 @@ pub trait MediaFormatMimeType {
 pub trait MediaFormatData {
     /// Include the data in the format.
     fn add_to_media_format(&self, media_format: &mut MediaFormat);
+}
+
+impl MediaFormatMimeType for &str {
+    fn mime_type(&self) -> &CStr {
+        let s = match *self {
+            "video/av01" => H264_MIME_TYPE,
+            "video/hevc" => HEVC_MIME_TYPE,
+            "video/avc" => H264_MIME_TYPE,
+            _ => panic!("Unsupported MIME type"),
+        };
+        unsafe { CStr::from_ptr(s.as_ptr().cast()) }
+    }
 }

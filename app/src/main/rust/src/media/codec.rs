@@ -1,10 +1,10 @@
 use super::{
-    format::{MediaFormat, MediaFormatMimeType},
+    format::MediaFormat,
     status::{AsMediaStatus, MediaStatus},
 };
 use crate::window::NativeWindow;
 use ndk_sys::{
-    AMediaCodec, AMediaCodecBufferInfo, AMediaCodec_configure, AMediaCodec_createDecoderByType,
+    AMediaCodec, AMediaCodecBufferInfo, AMediaCodec_configure, AMediaCodec_createCodecByName,
     AMediaCodec_delete, AMediaCodec_dequeueInputBuffer, AMediaCodec_dequeueOutputBuffer,
     AMediaCodec_getInputBuffer, AMediaCodec_queueInputBuffer, AMediaCodec_releaseOutputBuffer,
     AMediaCodec_setOutputSurface, AMediaCodec_start, AMediaCodec_stop,
@@ -13,7 +13,7 @@ use ndk_sys::{
     AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED, AMEDIACODEC_INFO_TRY_AGAIN_LATER,
 };
 use std::{
-    ffi::{c_long, c_ulong},
+    ffi::{c_long, c_ulong, CString},
     mem::MaybeUninit,
     ptr::NonNull,
 };
@@ -22,8 +22,9 @@ use std::{
 #[repr(transparent)]
 pub struct MediaCodec(NonNull<AMediaCodec>);
 
-// FIXME: Is this safe?
+// FIXME: Are these safe?
 unsafe impl Send for MediaCodec {}
+// unsafe impl Sync for MediaCodec {}
 
 impl Drop for MediaCodec {
     fn drop(&mut self) {
@@ -41,15 +42,13 @@ impl Drop for MediaCodec {
 
 impl MediaCodec {
     /// Create a decoder.
-    pub fn new_decoder<T>(kind: T) -> Result<MediaCodec, MediaStatus>
-    where
-        T: MediaFormatMimeType,
-    {
-        let ptr = unsafe { AMediaCodec_createDecoderByType(kind.mime_type().as_ptr()) };
+    pub fn create_by_name(name: &str) -> Result<MediaCodec, MediaStatus> {
+        let name = CString::new(name).map_err(|_| MediaStatus::StringNulError)?;
+        let ptr = unsafe { AMediaCodec_createCodecByName(name.as_ptr().cast()) };
         if let Some(decoder) = NonNull::new(ptr) {
             Ok(MediaCodec(decoder))
         } else {
-            Err(MediaStatus::NoDecoderForFormat)
+            Err(MediaStatus::MediaCodecCreationFailed)
         }
     }
 
@@ -134,7 +133,7 @@ impl MediaCodec {
 
     /// Get the index of the next available input buffer. Returns `MediaStatus::NoAvailableBuffer`
     /// if no buffer is available after the timeout.
-    fn dequeue_input_buffer(&self, timeout_micros: i64) -> Result<c_ulong, MediaStatus> {
+    pub fn dequeue_input_buffer(&self, timeout_micros: i64) -> Result<c_ulong, MediaStatus> {
         let index = unsafe { AMediaCodec_dequeueInputBuffer(self.as_inner(), timeout_micros) };
         match index {
             -1 => Err(MediaStatus::NoAvailableBuffer),
@@ -143,7 +142,7 @@ impl MediaCodec {
     }
 
     /// Get an input buffer.
-    fn get_input_buffer(&self, index: c_ulong) -> Result<&mut [u8], MediaStatus> {
+    pub fn get_input_buffer(&self, index: c_ulong) -> Result<&mut [u8], MediaStatus> {
         let mut buf_size = 0;
         unsafe {
             let buf_ptr = AMediaCodec_getInputBuffer(self.as_inner(), index, &mut buf_size);
@@ -156,7 +155,7 @@ impl MediaCodec {
     }
 
     /// Send the specified buffer to the codec for processing.
-    fn queue_input_buffer(
+    pub fn queue_input_buffer(
         &self,
         index: c_ulong,
         offset: i64,

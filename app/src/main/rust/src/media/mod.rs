@@ -4,5 +4,5 @@ mod status;
 
 pub use self::{
     codec::MediaCodec,
-    format::{VideoType, MediaFormat},
+    format::{MediaFormat, VideoType},
 };

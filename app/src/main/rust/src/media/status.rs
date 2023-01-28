@@ -5,7 +5,8 @@ use ndk_sys::media_status_t;
 pub enum MediaStatus {
     Sys(NonZeroSysMediaStatus),
     AllocationError,
-    NoDecoderForFormat,
+    StringNulError,
+    MediaCodecCreationFailed,
     NoAvailableBuffer,
 }
 
@@ -40,7 +41,7 @@ mod private {
 }
 
 /// `ndk_sys::media_status_t` but excluding `AMEDIA_OK`
-/// 
+///
 /// Also excludes `AMEDIA_ERROR_BASE` because it is a duplicate of `AMEDIA_ERROR_UNKNOWN`.
 #[allow(non_camel_case_types)]
 #[non_exhaustive]

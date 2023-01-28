@@ -34,9 +34,30 @@ impl WebSocketSignaler {
             rx: Mutex::new(rx),
         })
     }
+
+    async fn recv_impl(&self) -> Result<Message, WebSocketSignalerError> {
+        match self.rx.lock().await.next().await {
+            Some(ws_msg) => match ws_msg?.to_text() {
+                Ok(s) => {
+                    let msg = serde_json::from_str::<Message>(s)?;
+                    Ok(msg)
+                }
+                Err(_) => Err(WebSocketSignalerError::Serde),
+            },
+            None => Err(WebSocketSignalerError::Eof), // Closed
+        }
+    }
+
+    async fn send_impl(&self, msg: Message) -> Result<(), WebSocketSignalerError> {
+        let s = serde_json::to_string(&msg)?;
+        let ws_msg = tungstenite::Message::text(s);
+        self.tx.lock().await.send(ws_msg).await?;
+        Ok(())
+    }
 }
 
 /// Errors that WebSocketSignaler can emit
+#[derive(Debug)]
 pub enum WebSocketSignalerError {
     Tungstenite,
     Serde,
@@ -74,27 +95,21 @@ impl std::fmt::Display for WebSocketSignalerError {
     }
 }
 
+impl std::error::Error for WebSocketSignalerError {}
+
 #[async_trait::async_trait]
 impl Signaler for WebSocketSignaler {
-    type Error = WebSocketSignalerError;
-
-    async fn recv(&self) -> Result<Message, Self::Error> {
-        match self.rx.lock().await.next().await {
-            Some(ws_msg) => match ws_msg?.to_text() {
-                Ok(s) => {
-                    let msg = serde_json::from_str::<Message>(s)?;
-                    Ok(msg)
-                }
-                Err(_) => Err(WebSocketSignalerError::Serde),
-            },
-            None => Err(WebSocketSignalerError::Eof), // Closed
+    async fn recv(&self) -> Result<Message, Box<dyn std::error::Error + Send>> {
+        match self.recv_impl().await {
+            Ok(msg) => Ok(msg),
+            Err(e) => Err(Box::new(e)),
         }
     }
 
-    async fn send(&self, msg: Message) -> Result<(), Self::Error> {
-        let s = serde_json::to_string(&msg)?;
-        let ws_msg = tungstenite::Message::text(s);
-        self.tx.lock().await.send(ws_msg).await?;
-        Ok(())
+    async fn send(&self, msg: Message) -> Result<(), Box<dyn std::error::Error + Send>> {
+        match self.send_impl(msg).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(Box::new(e)),
+        }
     }
 }

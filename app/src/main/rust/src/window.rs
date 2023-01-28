@@ -6,6 +6,9 @@ use std::ptr::NonNull;
 #[repr(transparent)]
 pub struct NativeWindow(NonNull<ANativeWindow>);
 
+// FIXME: Is this safe?
+unsafe impl Send for NativeWindow {}
+
 impl Drop for NativeWindow {
     fn drop(&mut self) {
         unsafe {
