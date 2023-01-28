@@ -18,18 +18,18 @@ pub struct WebSocketSignaler {
 
 impl WebSocketSignaler {
     /// Create a new `WebSocketSignaler`.
-    pub async fn new(addr: impl Into<SocketAddr> + 'static) -> Option<WebSocketSignaler> {
+    pub async fn new(
+        addr: impl Into<SocketAddr> + 'static,
+    ) -> Result<WebSocketSignaler, WebSocketSignalerError> {
         let addr: SocketAddr = addr.into();
-        let socket = TcpSocket::new_v4().ok()?;
-        let tcp_stream = socket.connect(addr).await.ok()?;
+        let socket = TcpSocket::new_v4()?;
+        let tcp_stream = socket.connect(addr).await?;
 
         let (ws_stream, _response) =
-            tokio_tungstenite::client_async(format!("ws://{}", addr), tcp_stream)
-                .await
-                .ok()?;
+            tokio_tungstenite::client_async(format!("ws://{}", addr), tcp_stream).await?;
 
         let (tx, rx) = ws_stream.split();
-        Some(WebSocketSignaler {
+        Ok(WebSocketSignaler {
             tx: Mutex::new(tx),
             rx: Mutex::new(rx),
         })
@@ -61,6 +61,7 @@ impl WebSocketSignaler {
 pub enum WebSocketSignalerError {
     Tungstenite,
     Serde,
+    StdIo,
     Eof,
 }
 
@@ -78,6 +79,7 @@ macro_rules! impl_from {
 
 impl_from!(tungstenite::Error, Tungstenite);
 impl_from!(serde_json::Error, Serde);
+impl_from!(std::io::Error, StdIo);
 
 impl std::fmt::Display for WebSocketSignalerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -87,6 +89,9 @@ impl std::fmt::Display for WebSocketSignalerError {
             }
             WebSocketSignalerError::Serde => {
                 write!(f, "Failed to deserialize the message")
+            }
+            WebSocketSignalerError::StdIo => {
+                write!(f, "Failed to initialize TCP socket")
             }
             WebSocketSignalerError::Eof => {
                 write!(f, "WebSocket connection has been closed")

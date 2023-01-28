@@ -6,7 +6,7 @@ use ndk_sys::{
     AMediaFormat, AMediaFormat_delete, AMediaFormat_new, AMediaFormat_setBuffer,
     AMediaFormat_setInt32, AMediaFormat_setString, AMEDIAFORMAT_KEY_HEIGHT,
     AMEDIAFORMAT_KEY_MAX_HEIGHT, AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MIME,
-    AMEDIAFORMAT_KEY_PRIORITY, AMEDIAFORMAT_KEY_WIDTH, android_get_device_api_level, AMEDIAFORMAT_KEY_LOW_LATENCY
+    AMEDIAFORMAT_KEY_PRIORITY, AMEDIAFORMAT_KEY_WIDTH,
 };
 use std::{
     ffi::{c_char, CStr},
@@ -17,6 +17,7 @@ use std::{
 // only became available in API level 28.
 const MEDIAFORMAT_KEY_CSD_0: &'static str = "csd-0\0";
 const MEDIAFORMAT_KEY_CSD_1: &'static str = "csd-1\0";
+const MEDIAFORMAT_KEY_LOW_LATENCY: &'static str = "low-latency\0";
 
 const AV1_MIME_TYPE: &'static str = "video/av01\0";
 const HEVC_MIME_TYPE: &'static str = "video/hevc\0";
@@ -96,13 +97,11 @@ impl MediaFormat {
     /// Sets whether or not to enable low latency mode. Added in API level 30.
     pub fn set_low_latency(&mut self, low_latency: bool) {
         unsafe {
-            if android_get_device_api_level() >= 30 {
-                AMediaFormat_setInt32(
-                    self.as_inner(),
-                    AMEDIAFORMAT_KEY_LOW_LATENCY,
-                    if low_latency { 1 } else { 0 },
-                );
-            }
+            AMediaFormat_setInt32(
+                self.as_inner(),
+                MEDIAFORMAT_KEY_LOW_LATENCY.as_ptr().cast(),
+                if low_latency { 1 } else { 0 },
+            );
         }
     }
 

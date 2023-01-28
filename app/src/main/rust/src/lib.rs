@@ -1,4 +1,4 @@
-mod debug;
+// mod debug;
 mod log;
 mod media;
 mod util;
@@ -105,6 +105,15 @@ impl NativeLibSingleton {
 
     pub fn get_event_receiver(&self) -> broadcast::Receiver<MediaPlayerEvent> {
         self.sender.subscribe()
+    }
+
+    pub fn get_api_level(&self, env: &JNIEnv) -> Result<i32, jni::errors::Error> {
+        let method_output = env.call_method(self.singleton.as_obj(), "getApiLevel", "()I", &[])?;
+
+        match method_output {
+            JValue::Int(level) => Ok(level),
+            _ => Err(jni::errors::Error::JavaException),
+        }
     }
 
     /// Call the singleton method to set the aspect ratio of the player.
@@ -279,13 +288,9 @@ pub extern "system" fn start_media_player(
 ) {
     debug_assert_ne!(ptr, 0);
 
+    crate::info!("starting");
+
     let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
     arc.spawn(webrtc::start_webrtc);
-    arc.into_java_long(); // Prevent the `Arc` from being dropped
+    std::mem::forget(arc); // Prevent the `Arc` from being dropped
 }
-
-// async fn test_decode(manager: Arc<NativeLibSingleton>) {
-//     if let Err(e) = run_decoder(manager).await {
-//         println!("{e}");
-//     }
-// }

@@ -1,5 +1,5 @@
 use crate::{
-    media::{MediaEngine, MediaFormat, MediaTimeout},
+    media::{MediaEngine, MediaFormat, MediaStatus, MediaTimeout},
     window::NativeWindow,
     MediaPlayerEvent, NativeLibSingleton,
 };
@@ -58,7 +58,7 @@ impl DecoderBuilder for AndroidDecoderBuilder {
             let mut buf = vec![0u8; RTP_PACKET_MAX_SIZE];
             let mut receiver = singleton.get_event_receiver();
 
-            let decoder = create_decoder(
+            let decoder = match create_decoder(
                 &singleton,
                 &track,
                 &peer,
@@ -68,7 +68,13 @@ impl DecoderBuilder for AndroidDecoderBuilder {
                 &mut buf,
             )
             .await
-            .expect("Unable to create decoder");
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    crate::error!("Error creating decoder: {e:?}");
+                    return;
+                }
+            };
 
             let pli = PictureLossIndication {
                 sender_ssrc: 0,
@@ -79,6 +85,8 @@ impl DecoderBuilder for AndroidDecoderBuilder {
                 .dequeue_input_buffer(MediaTimeout::INFINITE)
                 .expect("Unable to get input buffer");
             let mut render = true;
+            let mut reader = H264PayloadReader::new(&mut input_buffer);
+            let mut last_sequence_number = None;
 
             loop {
                 if peer.connection_state() != RTCPeerConnectionState::Connected {
@@ -109,88 +117,77 @@ impl DecoderBuilder for AndroidDecoderBuilder {
                     Err(broadcast::error::TryRecvError::Closed) => return,
                     Err(broadcast::error::TryRecvError::Lagged(_)) => return,
                     Err(broadcast::error::TryRecvError::Empty) => {
-                        let mut reader = H264PayloadReader::new(&mut input_buffer);
-                        let mut last_sequence_number = None;
-
-                        loop {
-                            match tokio::time::timeout(
-                                Duration::from_millis(READ_TIMEOUT_MILLIS),
-                                track.read(&mut buf),
-                            )
-                            .await
-                            {
-                                Err(_) => {
-                                    crate::info!(
-                                        "Timed-out while reading from `TrackRemote`. Exiting.."
-                                    );
-                                    return;
-                                }
-                                Ok(read_result) => match read_result {
-                                    Err(_) => {
-                                        peer.write_rtcp(&[Box::new(pli.clone())])
-                                            .await
-                                            .expect("Failed to send PLI");
-                                        break;
-                                    }
-                                    Ok((n, _)) => {
-                                        let mut b = &buf[..n];
-
-                                        // Unmarshaling the header would move `b` to point to the payload
-                                        let header = rtp::header::Header::unmarshal(&mut b)
-                                            .expect("Error parsing RTP header");
-
-                                        // Check sequence number for skipped values
-                                        if let Some(last_sequence_number) =
-                                            &mut last_sequence_number
-                                        {
-                                            if header
-                                                .sequence_number
-                                                .wrapping_sub(*last_sequence_number)
-                                                != 1
-                                            {
-                                                peer.write_rtcp(&[Box::new(pli.clone())])
-                                                    .await
-                                                    .expect("Failed to send PLI");
-                                            }
-                                            *last_sequence_number = header.sequence_number;
-                                        } else {
-                                            last_sequence_number = Some(header.sequence_number);
-                                        }
-
-                                        match reader.read_payload(b) {
-                                            Ok(num_bytes) => {
-                                                decoder
-                                                    .queue_input_buffer(
-                                                        input_buffer,
-                                                        num_bytes as _,
-                                                        0,
-                                                        0,
-                                                    )
-                                                    .expect("Error queueing buffer");
-                                                decoder
-                                                    .release_output_buffer(
-                                                        MediaTimeout::INFINITE,
-                                                        render,
-                                                    )
-                                                    .unwrap();
-                                                input_buffer = decoder
-                                                    .dequeue_input_buffer(MediaTimeout::INFINITE)
-                                                    .expect("Unable to get input buffer");
-                                                break;
-                                            }
-                                            Err(H264PayloadReaderError::NeedMoreInput(r)) => {
-                                                reader = r
-                                            }
-                                            Err(_) => {
-                                                peer.write_rtcp(&[Box::new(pli.clone())])
-                                                    .await
-                                                    .expect("Failed to send PLI");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                },
+                        match tokio::time::timeout(
+                            Duration::from_millis(READ_TIMEOUT_MILLIS),
+                            track.read(&mut buf),
+                        )
+                        .await
+                        {
+                            Err(_) => {
+                                crate::info!("Timed-out while reading from `TrackRemote`");
+                                continue;
                             }
+                            Ok(read_result) => match read_result {
+                                Err(_) => {
+                                    peer.write_rtcp(&[Box::new(pli.clone())])
+                                        .await
+                                        .expect("Failed to send PLI");
+                                    reader = H264PayloadReader::new(&mut input_buffer);
+                                }
+                                Ok((n, _)) => {
+                                    let mut b = &buf[..n];
+
+                                    // Unmarshaling the header would move `b` to point to the payload
+                                    let header = rtp::header::Header::unmarshal(&mut b)
+                                        .expect("Error parsing RTP header");
+
+                                    // Check sequence number for skipped values
+                                    if let Some(last_sequence_number) = &mut last_sequence_number {
+                                        if header
+                                            .sequence_number
+                                            .wrapping_sub(*last_sequence_number)
+                                            != 1
+                                        {
+                                            peer.write_rtcp(&[Box::new(pli.clone())])
+                                                .await
+                                                .expect("Failed to send PLI");
+                                        }
+                                        *last_sequence_number = header.sequence_number;
+                                    } else {
+                                        last_sequence_number = Some(header.sequence_number);
+                                    }
+
+                                    match reader.read_payload(b) {
+                                        Ok(num_bytes) => {
+                                            decoder
+                                                .queue_input_buffer(
+                                                    input_buffer,
+                                                    num_bytes as _,
+                                                    0,
+                                                    0,
+                                                )
+                                                .expect("Error queueing buffer");
+                                            decoder
+                                                .release_output_buffer(
+                                                    MediaTimeout::INFINITE,
+                                                    render,
+                                                )
+                                                .unwrap();
+                                            input_buffer = decoder
+                                                .dequeue_input_buffer(MediaTimeout::INFINITE)
+                                                .expect("Unable to get input buffer");
+                                            reader = H264PayloadReader::new(&mut input_buffer);
+                                        }
+                                        Err(H264PayloadReaderError::NeedMoreInput(r)) => reader = r,
+                                        Err(_) => {
+                                            peer.write_rtcp(&[Box::new(pli.clone())])
+                                                .await
+                                                .expect("Failed to send PLI");
+                                            reader = H264PayloadReader::new(&mut input_buffer);
+                                        }
+                                    }
+                                }
+                            },
                         }
                     }
                 }
@@ -198,6 +195,34 @@ impl DecoderBuilder for AndroidDecoderBuilder {
         });
     }
 }
+
+#[derive(Debug)]
+enum DecoderError {
+    MediaEngine(MediaStatus),
+    HeaderParsing(webrtc::util::Error),
+    RtcpSend(webrtc::Error),
+    AttachThread(jni::errors::Error),
+    SetAspectRatio(jni::errors::Error),
+    NativeWindowCreate,
+    WebRtcDisconnected,
+    ApplicationClosed,
+}
+
+macro_rules! impl_from {
+    ($t:ty, $e:tt) => {
+        impl From<$t> for DecoderError {
+            #[inline]
+            fn from(e: $t) -> Self {
+                DecoderError::$e(e)
+            }
+        }
+    };
+}
+
+impl_from!(MediaStatus, MediaEngine);
+impl_from!(webrtc::util::Error, HeaderParsing);
+impl_from!(webrtc::Error, RtcpSend);
+impl_from!(jni::errors::Error, AttachThread);
 
 async fn create_decoder(
     singleton: &Arc<NativeLibSingleton>,
@@ -207,7 +232,7 @@ async fn create_decoder(
     decoder_name: &str,
     receiver: &mut broadcast::Receiver<MediaPlayerEvent>,
     buf: &mut [u8],
-) -> Option<MediaEngine> {
+) -> Result<MediaEngine, DecoderError> {
     let mut native_window = None;
     let mut format = None;
     let mut parameter_sets = None;
@@ -219,43 +244,39 @@ async fn create_decoder(
 
     loop {
         if peer.connection_state() != RTCPeerConnectionState::Connected {
-            return None;
+            return Err(DecoderError::WebRtcDisconnected);
         }
 
+        // If everything has been gathered, build the decoder
         if native_window.is_some() && format.is_some() && parameter_sets.is_some() {
-            let mut decoder =
-                MediaEngine::create_by_name(decoder_name).expect("Cannot create `MediaCodec`");
-            decoder
-                .initialize(&format.unwrap(), native_window, false)
-                .expect("Unable to initialize decoder");
+            let mut decoder = MediaEngine::create_by_name(decoder_name)?;
+            decoder.initialize(&format.unwrap(), native_window, false)?;
 
             let data: Bytes = parameter_sets.unwrap();
-            decoder
-                .submit_codec_config(&data)
-                .expect("Error submitting parameter sets");
-            return Some(decoder);
+            decoder.submit_codec_config(&data)?;
+            return Ok(decoder);
         }
 
         match receiver.try_recv() {
             Ok(msg) => match msg {
-                MediaPlayerEvent::MainActivityDestroyed => return None,
+                MediaPlayerEvent::MainActivityDestroyed => {
+                    return Err(DecoderError::ApplicationClosed)
+                }
                 MediaPlayerEvent::SurfaceCreated(surface) => {
-                    let env = singleton
-                        .vm
-                        .attach_current_thread()
-                        .expect("Unable attach VM to current thread");
+                    let env = singleton.vm.attach_current_thread()?;
                     native_window = Some(
                         NativeWindow::new(&env, &surface.as_obj())
-                            .expect("Cannot create `NativeWindow`"),
+                            .ok_or(DecoderError::NativeWindowCreate)?,
                     );
                 }
                 MediaPlayerEvent::SurfaceDestroyed => {
                     native_window = None;
-                    // Pause decoder?
                 }
             },
-            Err(broadcast::error::TryRecvError::Closed) => return None,
-            Err(broadcast::error::TryRecvError::Lagged(_)) => return None,
+            Err(broadcast::error::TryRecvError::Closed)
+            | Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                return Err(DecoderError::ApplicationClosed)
+            }
             Err(broadcast::error::TryRecvError::Empty) => {
                 match tokio::time::timeout(
                     Duration::from_millis(READ_TIMEOUT_MILLIS),
@@ -264,50 +285,43 @@ async fn create_decoder(
                 .await
                 {
                     Err(_) => {
-                        crate::info!("Timed-out while reading from `TrackRemote`. Exiting..");
-                        return None;
+                        crate::info!("Timed-out while reading from `TrackRemote`");
+                        continue;
                     }
                     Ok(read_result) => match read_result {
                         Err(_) => {
-                            peer.write_rtcp(&[Box::new(pli.clone())])
-                                .await
-                                .expect("Failed to send PLI");
+                            peer.write_rtcp(&[Box::new(pli.clone())]).await?;
                             continue;
                         }
                         Ok((n, _)) => {
                             let mut b = Bytes::copy_from_slice(&buf[..n]);
 
                             // Unmarshaling the header would move `b` to point to the payload
-                            let _header = rtp::header::Header::unmarshal(&mut b)
-                                .expect("Error parsing RTP header");
+                            let _header = rtp::header::Header::unmarshal(&mut b)?;
 
                             if let Some((width, height)) = H264Codec::get_resolution(&b) {
                                 let width = width as i32;
                                 let height = height as i32;
 
-                                format =
-                                    Some(MediaFormat::new().expect("Cannot create `MediaFormat`"));
+                                let env = singleton.vm.attach_current_thread()?;
+                                singleton
+                                    .set_media_player_aspect_ratio(&env, width, height)
+                                    .map_err(|e| DecoderError::SetAspectRatio(e))?;
+
+                                format = Some(MediaFormat::new()?);
                                 if let Some(format) = &mut format {
                                     format.set_mime_type(mime_type);
                                     format.set_realtime_priority(true);
-                                    format.set_low_latency(true);
                                     format.set_resolution(width, height);
                                     format.set_max_resolution(width, height);
+                                    if singleton.get_api_level(&env)? >= 30 {
+                                        format.set_low_latency(true);
+                                    }
                                 }
-
-                                let env = singleton
-                                    .vm
-                                    .attach_current_thread()
-                                    .expect("Unable attach VM to current thread");
-                                singleton
-                                    .set_media_player_aspect_ratio(&env, width, height)
-                                    .expect("Unable to set aspect ratio");
 
                                 parameter_sets = Some(b);
                             } else {
-                                peer.write_rtcp(&[Box::new(pli.clone())])
-                                    .await
-                                    .expect("Failed to send PLI");
+                                peer.write_rtcp(&[Box::new(pli.clone())]).await?;
                             }
                         }
                     },

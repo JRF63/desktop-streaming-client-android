@@ -1,5 +1,6 @@
 package com.debug.myapplication
 
+import android.os.Build
 import android.view.Surface
 
 object NativeLibSingleton {
@@ -58,5 +59,9 @@ object NativeLibSingleton {
 
     fun listProfilesForDecoder(decoderName: String, mimeType: String): IntArray? {
         return CodecQuerySingleton.listProfilesForDecoder(decoderName, mimeType)?.toIntArray()
+    }
+
+    fun getApiLevel(): Int {
+        return Build.VERSION.SDK_INT
     }
 }

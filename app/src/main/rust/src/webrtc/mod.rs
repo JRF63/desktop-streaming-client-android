@@ -7,20 +7,31 @@ use webrtc_helper::{peer::Role, WebRtcPeer};
 
 pub async fn start_webrtc(singleton: Arc<NativeLibSingleton>) {
     // TODO: Get from mDNS or something
-    let addr = ([127, 0, 0, 1], 9090);
+    let addr = ([192, 168, 1, 253], 9090);
 
-    let Some(signaler) = signaling::WebSocketSignaler::new(addr).await else {
-        crate::error!("Creation of WebSocket signaling channel failed");
-        return;
+    let signaler = match signaling::WebSocketSignaler::new(addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            crate::error!("Creation of WebSocket signaling channel failed: {e:?}");
+            return;
+        }
     };
 
-    let Ok(decoder_builder) = decoder::AndroidDecoderBuilder::new(singleton) else {
-        crate::error!("Failed to initialize an Android decoder");
-        return;
+    let decoder_builder = match decoder::AndroidDecoderBuilder::new(singleton) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::error!("Failed to initialize an Android decoder: {e:?}");
+            return;
+        }
     };
 
+    android_logger::init_once(
+        android_logger::Config::default().with_min_level(log::Level::Trace),
+    );
+    
     let mut peer_builder = WebRtcPeer::builder(signaler, Role::Offerer);
     peer_builder.with_decoder(Box::new(decoder_builder));
+
     let Ok(peer) = peer_builder.build().await else {
         crate::error!("Failed to initialize a WebRTC connection");
         return;
