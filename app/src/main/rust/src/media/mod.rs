@@ -1,8 +1,8 @@
-mod codec;
+mod engine;
 mod format;
 mod status;
 
 pub use self::{
-    codec::MediaCodec,
+    engine::{MediaEngine, MediaTimeout},
     format::{MediaFormat, VideoType},
 };

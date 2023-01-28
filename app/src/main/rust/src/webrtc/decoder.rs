@@ -1,5 +1,5 @@
 use crate::{
-    media::{MediaCodec, MediaFormat},
+    media::{MediaEngine, MediaFormat, MediaTimeout},
     window::NativeWindow,
     MediaPlayerEvent, NativeLibSingleton,
 };
@@ -19,6 +19,7 @@ use webrtc_helper::{
 };
 
 const RTP_PACKET_MAX_SIZE: usize = 1500;
+const READ_TIMEOUT_MILLIS: u64 = 5000;
 
 pub struct AndroidDecoderBuilder {
     singleton: Arc<NativeLibSingleton>,
@@ -40,7 +41,8 @@ impl DecoderBuilder for AndroidDecoderBuilder {
         let singleton = self.singleton;
         let codec_map = self.codec_map;
 
-        tokio::spawn(async move {
+        let handle = tokio::runtime::Handle::current();
+        handle.spawn(async move {
             while peer.connection_state() != RTCPeerConnectionState::Connected {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -48,7 +50,7 @@ impl DecoderBuilder for AndroidDecoderBuilder {
             // TODO: Check sdp_fmtp_line for SPS/PPS
             let codec_params = track.codec().await;
             let mime_type = &codec_params.capability.mime_type;
-            let clock_rate = codec_params.capability.clock_rate;
+
             let decoder_name = codec_map
                 .get(mime_type)
                 .expect("No decoder for chosen MIME type");
@@ -73,8 +75,10 @@ impl DecoderBuilder for AndroidDecoderBuilder {
                 media_ssrc: track.ssrc(),
             };
 
-            let mut index = decoder.dequeue_input_buffer(-1).unwrap();
-            let mut buffer = decoder.get_input_buffer(index as _).unwrap();
+            let mut input_buffer = decoder
+                .dequeue_input_buffer(MediaTimeout::INFINITE)
+                .expect("Unable to get input buffer");
+            let mut render = true;
 
             loop {
                 if peer.connection_state() != RTCPeerConnectionState::Connected {
@@ -84,57 +88,108 @@ impl DecoderBuilder for AndroidDecoderBuilder {
                 match receiver.try_recv() {
                     Ok(msg) => match msg {
                         MediaPlayerEvent::MainActivityDestroyed => return,
-                        MediaPlayerEvent::SurfaceCreated(_) => return,
-                        MediaPlayerEvent::SurfaceDestroyed => return,
+                        MediaPlayerEvent::SurfaceCreated(surface) => {
+                            let env = singleton
+                                .vm
+                                .attach_current_thread()
+                                .expect("Unable attach VM to current thread");
+                            let native_window = NativeWindow::new(&env, &surface.as_obj())
+                                .expect("Cannot create `NativeWindow`");
+                            decoder
+                                .set_output_surface(&native_window)
+                                .expect("Unable to set output surface");
+                            // Rendering is possible again
+                            render = true;
+                        }
+                        MediaPlayerEvent::SurfaceDestroyed => {
+                            // Stop rendering when there is no surface to render to
+                            render = false;
+                        }
                     },
                     Err(broadcast::error::TryRecvError::Closed) => return,
                     Err(broadcast::error::TryRecvError::Lagged(_)) => return,
                     Err(broadcast::error::TryRecvError::Empty) => {
-                        let mut reader = H264PayloadReader::new(buffer);
+                        let mut reader = H264PayloadReader::new(&mut input_buffer);
                         let mut last_sequence_number = None;
 
-                        while let Ok((n, _)) = track.read(&mut buf).await {
-                            let mut b = &buf[..n];
-
-                            // Unmarshaling the header would move `b` to point to the payload
-                            let header = rtp::header::Header::unmarshal(&mut b)
-                                .expect("Error parsing RTP header");
-
-                            // Check sequence number for skipped values
-                            if let Some(last_sequence_number) = &mut last_sequence_number {
-                                if header.sequence_number.wrapping_sub(*last_sequence_number) != 1 {
-                                    peer.write_rtcp(&[Box::new(pli.clone())])
-                                        .await
-                                        .expect("Failed to send PLI");
-                                }
-                                *last_sequence_number = header.sequence_number;
-                            } else {
-                                last_sequence_number = Some(header.sequence_number);
-                            }
-
-                            match reader.read_payload(b) {
-                                Ok(num_bytes) => {
-                                    let timestamp = header.timestamp * 1_000_000 / clock_rate;
-                                    decoder
-                                        .queue_input_buffer(
-                                            index as _,
-                                            0,
-                                            num_bytes as _,
-                                            timestamp as _,
-                                            0,
-                                        )
-                                        .unwrap();
-                                    index = decoder.dequeue_input_buffer(-1).unwrap();
-                                    buffer = decoder.get_input_buffer(index as _).unwrap();
-                                    break;
-                                }
-                                Err(H264PayloadReaderError::NeedMoreInput(r)) => reader = r,
+                        loop {
+                            match tokio::time::timeout(
+                                Duration::from_millis(READ_TIMEOUT_MILLIS),
+                                track.read(&mut buf),
+                            )
+                            .await
+                            {
                                 Err(_) => {
-                                    peer.write_rtcp(&[Box::new(pli.clone())])
-                                        .await
-                                        .expect("Failed to send PLI");
-                                    break;
+                                    crate::info!(
+                                        "Timed-out while reading from `TrackRemote`. Exiting.."
+                                    );
+                                    return;
                                 }
+                                Ok(read_result) => match read_result {
+                                    Err(_) => {
+                                        peer.write_rtcp(&[Box::new(pli.clone())])
+                                            .await
+                                            .expect("Failed to send PLI");
+                                        break;
+                                    }
+                                    Ok((n, _)) => {
+                                        let mut b = &buf[..n];
+
+                                        // Unmarshaling the header would move `b` to point to the payload
+                                        let header = rtp::header::Header::unmarshal(&mut b)
+                                            .expect("Error parsing RTP header");
+
+                                        // Check sequence number for skipped values
+                                        if let Some(last_sequence_number) =
+                                            &mut last_sequence_number
+                                        {
+                                            if header
+                                                .sequence_number
+                                                .wrapping_sub(*last_sequence_number)
+                                                != 1
+                                            {
+                                                peer.write_rtcp(&[Box::new(pli.clone())])
+                                                    .await
+                                                    .expect("Failed to send PLI");
+                                            }
+                                            *last_sequence_number = header.sequence_number;
+                                        } else {
+                                            last_sequence_number = Some(header.sequence_number);
+                                        }
+
+                                        match reader.read_payload(b) {
+                                            Ok(num_bytes) => {
+                                                decoder
+                                                    .queue_input_buffer(
+                                                        input_buffer,
+                                                        num_bytes as _,
+                                                        0,
+                                                        0,
+                                                    )
+                                                    .expect("Error queueing buffer");
+                                                decoder
+                                                    .release_output_buffer(
+                                                        MediaTimeout::INFINITE,
+                                                        render,
+                                                    )
+                                                    .unwrap();
+                                                input_buffer = decoder
+                                                    .dequeue_input_buffer(MediaTimeout::INFINITE)
+                                                    .expect("Unable to get input buffer");
+                                                break;
+                                            }
+                                            Err(H264PayloadReaderError::NeedMoreInput(r)) => {
+                                                reader = r
+                                            }
+                                            Err(_) => {
+                                                peer.write_rtcp(&[Box::new(pli.clone())])
+                                                    .await
+                                                    .expect("Failed to send PLI");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
                             }
                         }
                     }
@@ -152,10 +207,15 @@ async fn create_decoder(
     decoder_name: &str,
     receiver: &mut broadcast::Receiver<MediaPlayerEvent>,
     buf: &mut [u8],
-) -> Option<MediaCodec> {
+) -> Option<MediaEngine> {
     let mut native_window = None;
     let mut format = None;
     let mut parameter_sets = None;
+
+    let pli = PictureLossIndication {
+        sender_ssrc: 0,
+        media_ssrc: track.ssrc(),
+    };
 
     loop {
         if peer.connection_state() != RTCPeerConnectionState::Connected {
@@ -164,18 +224,14 @@ async fn create_decoder(
 
         if native_window.is_some() && format.is_some() && parameter_sets.is_some() {
             let mut decoder =
-                MediaCodec::create_by_name(decoder_name).expect("Cannot create `MediaCodec`");
+                MediaEngine::create_by_name(decoder_name).expect("Cannot create `MediaCodec`");
             decoder
                 .initialize(&format.unwrap(), native_window, false)
                 .expect("Unable to initialize decoder");
 
             let data: Bytes = parameter_sets.unwrap();
             decoder
-                .submit_codec_config(|buffer| {
-                    let min_len = data.len().min(buffer.len());
-                    buffer[..min_len].copy_from_slice(&data[..min_len]);
-                    (min_len, 0)
-                })
+                .submit_codec_config(&data)
                 .expect("Error submitting parameter sets");
             return Some(decoder);
         }
@@ -201,44 +257,60 @@ async fn create_decoder(
             Err(broadcast::error::TryRecvError::Closed) => return None,
             Err(broadcast::error::TryRecvError::Lagged(_)) => return None,
             Err(broadcast::error::TryRecvError::Empty) => {
-                if let Ok((n, _)) = track.read(buf).await {
-                    let mut b = Bytes::copy_from_slice(&buf[..n]);
-
-                    // Unmarshaling the header would move `b` to point to the payload
-                    let _header =
-                        rtp::header::Header::unmarshal(&mut b).expect("Error parsing RTP header");
-
-                    if let Some((width, height)) = H264Codec::get_resolution(&b) {
-                        let width = width as i32;
-                        let height = height as i32;
-
-                        format = Some(MediaFormat::new().expect("Cannot create `MediaFormat`"));
-                        if let Some(format) = &mut format {
-                            format.set_mime_type(mime_type);
-                            format.set_realtime_priority(true);
-                            format.set_resolution(width, height);
-                            format.set_max_resolution(width, height);
-                        }
-
-                        let env = singleton
-                            .vm
-                            .attach_current_thread()
-                            .expect("Unable attach VM to current thread");
-                        singleton
-                            .set_media_player_aspect_ratio(&env, width, height)
-                            .expect("Unable to set aspect ratio");
-
-                        parameter_sets = Some(b);
-                    } else {
-                        // send nack pli
-                        let pli = PictureLossIndication {
-                            sender_ssrc: 0,
-                            media_ssrc: track.ssrc(),
-                        };
-                        peer.write_rtcp(&[Box::new(pli)])
-                            .await
-                            .expect("Failed to send PLI");
+                match tokio::time::timeout(
+                    Duration::from_millis(READ_TIMEOUT_MILLIS),
+                    track.read(buf),
+                )
+                .await
+                {
+                    Err(_) => {
+                        crate::info!("Timed-out while reading from `TrackRemote`. Exiting..");
+                        return None;
                     }
+                    Ok(read_result) => match read_result {
+                        Err(_) => {
+                            peer.write_rtcp(&[Box::new(pli.clone())])
+                                .await
+                                .expect("Failed to send PLI");
+                            continue;
+                        }
+                        Ok((n, _)) => {
+                            let mut b = Bytes::copy_from_slice(&buf[..n]);
+
+                            // Unmarshaling the header would move `b` to point to the payload
+                            let _header = rtp::header::Header::unmarshal(&mut b)
+                                .expect("Error parsing RTP header");
+
+                            if let Some((width, height)) = H264Codec::get_resolution(&b) {
+                                let width = width as i32;
+                                let height = height as i32;
+
+                                format =
+                                    Some(MediaFormat::new().expect("Cannot create `MediaFormat`"));
+                                if let Some(format) = &mut format {
+                                    format.set_mime_type(mime_type);
+                                    format.set_realtime_priority(true);
+                                    format.set_low_latency(true);
+                                    format.set_resolution(width, height);
+                                    format.set_max_resolution(width, height);
+                                }
+
+                                let env = singleton
+                                    .vm
+                                    .attach_current_thread()
+                                    .expect("Unable attach VM to current thread");
+                                singleton
+                                    .set_media_player_aspect_ratio(&env, width, height)
+                                    .expect("Unable to set aspect ratio");
+
+                                parameter_sets = Some(b);
+                            } else {
+                                peer.write_rtcp(&[Box::new(pli.clone())])
+                                    .await
+                                    .expect("Failed to send PLI");
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -321,75 +393,3 @@ fn h264_profile_from_android_id(id: i32) -> Option<H264Profile> {
         }
     }
 }
-
-// async fn run_decoder(
-//     manager: Arc<NativeLibSingleton>,
-//     track: Arc<TrackRemote>,
-//     rtp_receiver: Arc<RTCRtpReceiver>,
-//     ice_connection_state: IceConnectionState,
-// ) -> Option<()> {
-//     let mut receiver = manager.get_event_receiver();
-//     loop {
-//         match receiver.recv().await {
-//             Ok(msg) => match msg {
-//                 MediaPlayerEvent::SurfaceCreated(java_surface) => {
-//                     let env = manager.vm.attach_current_thread()?;
-
-//                     let native_window = NativeWindow::new(&env, &java_surface.as_obj()).ok()?;
-
-//                     let width = 1920;
-//                     let height = 1080;
-
-//                     manager.set_media_player_aspect_ratio(&env, width, height)?;
-
-//                     let mut format = MediaFormat::new()?;
-//                     format.set_resolution(width, height);
-//                     format.set_max_resolution(width, height);
-//                     format.set_mime_type(media::VideoType::H264);
-//                     format.set_realtime_priority(true);
-
-//                     let mut decoder = MediaCodec::new_decoder(media::VideoType::H264)?;
-//                     decoder.initialize(&format, Some(native_window), false)?;
-
-//                     crate::info!("created decoder");
-
-//                     const FRAME_INTERVAL_MICROS: u64 = 16_666;
-//                     let dur = std::time::Duration::from_micros(FRAME_INTERVAL_MICROS);
-//                     let mut time = 0;
-
-//                     decoder.submit_codec_config(|buffer| {
-//                         let data = debug::CSD;
-//                         let min_len = data.len().min(buffer.len());
-//                         buffer[..min_len].copy_from_slice(&data[..min_len]);
-//                         (min_len, 0)
-//                     })?;
-
-//                     for packet_index in 0..119 {
-//                         crate::info!("decode: {packet_index}");
-//                         decoder.decode(|buffer| {
-//                             let data = debug::PACKETS[packet_index];
-//                             let min_len = data.len().min(buffer.len());
-//                             buffer[..min_len].copy_from_slice(&data[..min_len]);
-//                             (min_len, time)
-//                         })?;
-//                         time += FRAME_INTERVAL_MICROS;
-//                         decoder.render_output()?;
-//                         std::thread::sleep(dur);
-//                     }
-//                     decoder.decode(|buffer| {
-//                         let data = debug::PACKETS[119];
-//                         let min_len = data.len().min(buffer.len());
-//                         buffer[..min_len].copy_from_slice(&data[..min_len]);
-//                         (min_len, time)
-//                     })?;
-//                     decoder.render_output()?;
-//                 }
-//                 msg => anyhow::bail!("Unexpected message while waiting for a surface: {msg:?}"),
-//             },
-//             Err(e) => anyhow::bail!("Channel closed: {e}"),
-//         }
-//     }
-
-//     #[allow(unreachable_code)]
-//     Some(())
-// }

@@ -4,34 +4,31 @@ use super::{
 };
 use crate::window::NativeWindow;
 use ndk_sys::{
-    AMediaCodec, AMediaCodecBufferInfo, AMediaCodec_configure, AMediaCodec_createCodecByName,
-    AMediaCodec_delete, AMediaCodec_dequeueInputBuffer, AMediaCodec_dequeueOutputBuffer,
-    AMediaCodec_getInputBuffer, AMediaCodec_queueInputBuffer, AMediaCodec_releaseOutputBuffer,
-    AMediaCodec_setOutputSurface, AMediaCodec_start, AMediaCodec_stop,
-    AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM,
+    AMediaCodec, AMediaCodec_configure, AMediaCodec_createCodecByName, AMediaCodec_delete,
+    AMediaCodec_dequeueInputBuffer, AMediaCodec_dequeueOutputBuffer, AMediaCodec_getInputBuffer,
+    AMediaCodec_queueInputBuffer, AMediaCodec_releaseOutputBuffer, AMediaCodec_setOutputSurface,
+    AMediaCodec_start, AMediaCodec_stop, AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG,
     AMEDIACODEC_CONFIGURE_FLAG_ENCODE, AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED,
     AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED, AMEDIACODEC_INFO_TRY_AGAIN_LATER,
 };
 use std::{
     ffi::{c_long, c_ulong, CString},
     mem::MaybeUninit,
+    ops::{Deref, DerefMut},
     ptr::NonNull,
+    time::Duration,
 };
 
 /// Encapsulates a encoder/decoder.
 #[repr(transparent)]
-pub struct MediaCodec(NonNull<AMediaCodec>);
+pub struct MediaEngine(NonNull<AMediaCodec>);
 
-// FIXME: Are these safe?
-unsafe impl Send for MediaCodec {}
-// unsafe impl Sync for MediaCodec {}
+// FIXME: Is this safe?
+unsafe impl Send for MediaEngine {}
 
-impl Drop for MediaCodec {
+impl Drop for MediaEngine {
     fn drop(&mut self) {
         unsafe {
-            if let Err(e) = self.signal_end_of_stream() {
-                crate::error!("Error signaling end of stream: {e}");
-            }
             if let Err(e) = AMediaCodec_stop(self.as_inner()).success() {
                 crate::error!("Error stoping the `MediaCodec`: {e}");
             }
@@ -40,13 +37,13 @@ impl Drop for MediaCodec {
     }
 }
 
-impl MediaCodec {
-    /// Create a decoder.
-    pub fn create_by_name(name: &str) -> Result<MediaCodec, MediaStatus> {
+impl MediaEngine {
+    /// Create a new `MediaEngine`.
+    pub fn create_by_name(name: &str) -> Result<MediaEngine, MediaStatus> {
         let name = CString::new(name).map_err(|_| MediaStatus::StringNulError)?;
         let ptr = unsafe { AMediaCodec_createCodecByName(name.as_ptr().cast()) };
         if let Some(decoder) = NonNull::new(ptr) {
-            Ok(MediaCodec(decoder))
+            Ok(MediaEngine(decoder))
         } else {
             Err(MediaStatus::MediaCodecCreationFailed)
         }
@@ -94,71 +91,50 @@ impl MediaCodec {
         unsafe { AMediaCodec_setOutputSurface(self.as_inner(), window.as_inner()).success() }
     }
 
-    /// Submits the codec specific data. Must be called before `MediaCodec::decode`.
-    pub fn submit_codec_config<F>(&self, func: F) -> Result<(), MediaStatus>
-    where
-        F: FnMut(&mut [u8]) -> (usize, u64),
-    {
-        self.decode_inner(func, AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG as u32)
-    }
+    /// Submits the codec specific data. Must be called before submitting frame data.
+    pub fn submit_codec_config(&self, data: &[u8]) -> Result<(), MediaStatus> {
+        let mut input_buffer = self.dequeue_input_buffer(MediaTimeout::INFINITE)?;
+        let min_len = data.len().min(input_buffer.len());
+        input_buffer[..min_len].copy_from_slice(&data[..min_len]);
 
-    /// Decodes the given data.
-    pub fn decode<F>(&self, func: F) -> Result<(), MediaStatus>
-    where
-        F: FnMut(&mut [u8]) -> (usize, u64),
-    {
-        self.decode_inner(func, 0)
-    }
-
-    pub fn signal_end_of_stream(&self) -> Result<(), MediaStatus> {
-        self.decode_inner(|_| (0, 0), AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32)
-    }
-
-    #[inline(always)]
-    fn decode_inner<F>(&self, mut func: F, flags: u32) -> Result<(), MediaStatus>
-    where
-        F: FnMut(&mut [u8]) -> (usize, u64),
-    {
-        let index = self.dequeue_input_buffer(-1)?;
-        let buffer = self.get_input_buffer(index)?;
-        let (num_bytes, present_time_micros) = func(buffer);
         self.queue_input_buffer(
-            index,
+            input_buffer,
+            min_len as c_ulong,
             0,
-            num_bytes as c_ulong,
-            present_time_micros,
-            flags as u32,
+            AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG as u32,
         )
     }
 
-    /// Get the index of the next available input buffer. Returns `MediaStatus::NoAvailableBuffer`
-    /// if no buffer is available after the timeout.
-    pub fn dequeue_input_buffer(&self, timeout_micros: i64) -> Result<c_ulong, MediaStatus> {
-        let index = unsafe { AMediaCodec_dequeueInputBuffer(self.as_inner(), timeout_micros) };
-        match index {
-            -1 => Err(MediaStatus::NoAvailableBuffer),
-            index => Ok(index as c_ulong),
+    /// Get the next available input buffer. Returns `MediaStatus::NoAvailableBuffer` if no buffer
+    /// is available after the timeout.
+    #[inline(always)]
+    pub fn dequeue_input_buffer(
+        &self,
+        timeout: MediaTimeout,
+    ) -> Result<MediaInputBuffer, MediaStatus> {
+        let index = unsafe { AMediaCodec_dequeueInputBuffer(self.as_inner(), timeout.0) };
+        if index == -1 {
+            return Err(MediaStatus::NoAvailableBuffer);
         }
-    }
+        let index = index as c_ulong;
 
-    /// Get an input buffer.
-    pub fn get_input_buffer(&self, index: c_ulong) -> Result<&mut [u8], MediaStatus> {
         let mut buf_size = 0;
         unsafe {
             let buf_ptr = AMediaCodec_getInputBuffer(self.as_inner(), index, &mut buf_size);
             if buf_ptr.is_null() {
                 Err(MediaStatus::AllocationError)
             } else {
-                Ok(std::slice::from_raw_parts_mut(buf_ptr, buf_size as usize))
+                let buffer = std::slice::from_raw_parts_mut(buf_ptr, buf_size as usize);
+                Ok(MediaInputBuffer { index, buffer })
             }
         }
     }
 
     /// Send the specified buffer to the codec for processing.
+    #[inline(always)]
     pub fn queue_input_buffer(
         &self,
-        index: c_ulong,
-        offset: i64,
+        input_buffer: MediaInputBuffer,
         num_bytes: c_ulong,
         present_time_micros: u64,
         flags: u32,
@@ -166,8 +142,8 @@ impl MediaCodec {
         unsafe {
             AMediaCodec_queueInputBuffer(
                 self.as_inner(),
-                index,
-                offset,
+                input_buffer.index,
+                0,
                 num_bytes,
                 present_time_micros,
                 flags,
@@ -177,15 +153,21 @@ impl MediaCodec {
     }
 
     /// Renders the decoder output to the surface.
-    pub fn render_output(&self) -> Result<(), MediaStatus> {
+    #[inline(always)]
+    pub fn release_output_buffer(
+        &self,
+        timeout: MediaTimeout,
+        render: bool,
+    ) -> Result<(), MediaStatus> {
         const TRY_AGAIN_LATER: c_long = AMEDIACODEC_INFO_TRY_AGAIN_LATER as c_long;
         const OUTPUT_FORMAT_CHANGED: c_long = AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED as c_long;
         const OUTPUT_BUFFERS_CHANGED: c_long = AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED as c_long;
 
-        // Leave uninit because this is unused.
         let mut buffer_info = MaybeUninit::uninit();
 
-        match self.dequeue_output_buffer(buffer_info.as_mut_ptr(), -1) {
+        match unsafe {
+            AMediaCodec_dequeueOutputBuffer(self.as_inner(), buffer_info.as_mut_ptr(), timeout.0)
+        } {
             TRY_AGAIN_LATER => {
                 // This should be unreachable since timeout is set to be infinite
                 Err(MediaStatus::NoAvailableBuffer)
@@ -202,23 +184,50 @@ impl MediaCodec {
             }
             index => {
                 // Proper index, use on `AMediaCodec_releaseOutputBuffer`
-                self.release_output_buffer(index as c_ulong, true)?;
-                Ok(())
+                unsafe {
+                    AMediaCodec_releaseOutputBuffer(self.as_inner(), index as c_ulong, render)
+                        .success()
+                }
             }
         }
     }
+}
 
-    /// Get the index of the next available buffer of processed data.
-    fn dequeue_output_buffer(
-        &self,
-        buffer_info: *mut AMediaCodecBufferInfo,
-        timeout_micros: i64,
-    ) -> c_long {
-        unsafe { AMediaCodec_dequeueOutputBuffer(self.as_inner(), buffer_info, timeout_micros) }
+/// Input to the `MediaEngine`.
+pub struct MediaInputBuffer<'a> {
+    index: c_ulong,
+    buffer: &'a mut [u8],
+}
+
+impl<'a> Deref for MediaInputBuffer<'a> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.buffer
     }
+}
 
-    /// Return the buffer to the codec.
-    fn release_output_buffer(&self, index: c_ulong, render: bool) -> Result<(), MediaStatus> {
-        unsafe { AMediaCodec_releaseOutputBuffer(self.as_inner(), index, render).success() }
+impl<'a> DerefMut for MediaInputBuffer<'a> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buffer
+    }
+}
+
+/// Timeout value for `MediaEngine` methods.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaTimeout(i64);
+
+impl MediaTimeout {
+    /// Signals to the operation to wait indefinitely.
+    pub const INFINITE: MediaTimeout = MediaTimeout(-1);
+
+    /// Create a new `MediaTimeout`. The timeout given must be less than or equal to `i64::MAX`
+    /// microseconds (9223372036854775807).
+    pub fn new(timeout: Duration) -> MediaTimeout {
+        let timeout_micros = timeout.as_micros();
+        assert!(timeout_micros <= i64::MAX as u128);
+        MediaTimeout(timeout_micros as i64)
     }
 }
