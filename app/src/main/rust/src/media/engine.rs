@@ -30,7 +30,7 @@ impl Drop for MediaEngine {
     fn drop(&mut self) {
         unsafe {
             if let Err(e) = AMediaCodec_stop(self.as_inner()).success() {
-                crate::error!("Error stoping the `MediaCodec`: {e}");
+                log::error!("Error stoping the `MediaCodec`: {e}");
             }
             AMediaCodec_delete(self.0.as_ptr());
         }

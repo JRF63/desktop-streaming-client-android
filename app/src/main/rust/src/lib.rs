@@ -1,5 +1,4 @@
-mod debug;
-mod log;
+// mod debug;
 mod media;
 mod util;
 mod webrtc;
@@ -9,6 +8,7 @@ mod window;
 // C:\Users\Rafael\AppData\Local\Android\Sdk\emulator\emulator -avd Pixel_3_XL_API_31
 // gradlew installX86_64Debug
 
+use self::media::MimeType;
 use jni::{
     objects::{GlobalRef, JObject, JString, JValue, ReleaseMode},
     JNIEnv, JavaVM,
@@ -42,7 +42,10 @@ impl std::fmt::Debug for MediaPlayerEvent {
     }
 }
 
-/// Thread pool that runs the native code.
+/// Mirror of the `NativeLibSingleton` in the Kotlin code. The two serves as a convenience bridge
+/// for calling code across the languages.
+///
+/// This struct serves as a thread pool manager via the Tokio runtime that handles the async tasks.
 pub struct NativeLibSingleton {
     vm: JavaVM,
     singleton: GlobalRef,
@@ -72,7 +75,7 @@ impl NativeLibSingleton {
     /// Signal an `ActivityEvent`.
     pub fn signal_event(&self, event: MediaPlayerEvent) {
         if let Err(e) = self.sender.send(event) {
-            crate::error!("{e}");
+            log::error!("{e}");
         }
     }
 
@@ -98,6 +101,7 @@ impl NativeLibSingleton {
         &self.vm
     }
 
+    /// Spawn an async function on the runtime.
     pub fn spawn<T, F>(self: &Arc<NativeLibSingleton>, func: T)
     where
         T: FnOnce(Arc<NativeLibSingleton>) -> F,
@@ -107,11 +111,13 @@ impl NativeLibSingleton {
         self.runtime.spawn(func(self.clone()));
     }
 
+    /// Get the receiver part of the `MediaPlayerEvent` channel.
     pub fn get_event_receiver(&self) -> Option<UnboundedReceiver<MediaPlayerEvent>> {
         let mut lock_guard = self.receiver.lock().ok()?;
         lock_guard.take()
     }
 
+    /// Returns the API level of the device that this is currently running on.
     pub fn get_api_level(&self, env: &JNIEnv) -> Result<i32, jni::errors::Error> {
         let method_output = env.call_method(self.singleton.as_obj(), "getApiLevel", "()I", &[])?;
 
@@ -143,22 +149,21 @@ impl NativeLibSingleton {
         Ok(())
     }
 
+    /// Choose a decoder for the given MIME type. The logic is handled on the Kotlin side.
     pub fn choose_decoder_for_type(
         &self,
         env: &JNIEnv,
-        mime_type: &str,
+        mime_type: MimeType,
     ) -> Result<Option<String>, jni::errors::Error> {
-        let mime_type = env.new_string(mime_type)?;
+        let mime_type = env.new_string(mime_type.to_android_str())?;
         let method_output = env.call_method(
             self.singleton.as_obj(),
             "chooseDecoderForType",
             "(Ljava/lang/String;)Ljava/lang/String;",
             &[mime_type.into()],
         )?;
-
-        let JValue::Object(obj) = method_output else {
-            return Err(jni::errors::Error::JavaException);
-        };
+        
+        let obj = method_output.l()?;
         if obj.into_raw().is_null() {
             return Ok(None);
         }
@@ -171,14 +176,15 @@ impl NativeLibSingleton {
         Ok(Some(s.to_owned()))
     }
 
+    /// List the available codec profiles for the decoder.
     pub fn list_profiles_for_decoder(
         &self,
         env: &JNIEnv,
         decoder_name: &str,
-        mime_type: &str,
+        mime_type: MimeType,
     ) -> Result<Option<Vec<i32>>, jni::errors::Error> {
         let decoder_name = env.new_string(decoder_name)?;
-        let mime_type = env.new_string(mime_type)?;
+        let mime_type = env.new_string(mime_type.to_android_str())?;
         let method_output = env.call_method(
             self.singleton.as_obj(),
             "listProfilesForDecoder",
@@ -186,9 +192,7 @@ impl NativeLibSingleton {
             &[decoder_name.into(), mime_type.into()],
         )?;
 
-        let JValue::Object(obj) = method_output else {
-            return Err(jni::errors::Error::JavaException);
-        };
+        let obj = method_output.l()?;
         if obj.into_raw().is_null() {
             return Ok(None);
         }
@@ -214,7 +218,7 @@ pub extern "system" fn create_native_instance(
     let vm = match env.get_java_vm() {
         Ok(vm) => vm,
         Err(e) => {
-            crate::error!("{e}");
+            log::error!("{e}");
             return 0;
         }
     };
@@ -224,15 +228,22 @@ pub extern "system" fn create_native_instance(
     let singleton = match env.new_global_ref(singleton) {
         Ok(s) => s,
         Err(e) => {
-            crate::error!("{e}");
+            log::error!("{e}");
             return 0;
         }
     };
 
     match NativeLibSingleton::new(vm, singleton) {
-        Ok(instance) => Arc::new(instance).into_java_long(),
+        Ok(instance) => {
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_min_level(log::Level::Info)
+                    .with_tag("client-android"),
+            );
+            Arc::new(instance).into_java_long()
+        }
         Err(e) => {
-            crate::error!("Error creating native instance: {e}");
+            log::error!("Error creating native instance: {e}");
             0
         }
     }
@@ -252,6 +263,7 @@ pub extern "system" fn destroy_native_instance(
     }
 }
 
+/// Sends the `MediaPlayerActivity`'s `android.view.Surface` to the decoder.
 #[export_name = "Java_com_debug_myapplication_NativeLibSingleton_sendSurface"]
 pub extern "system" fn send_surface(
     env: JNIEnv,
@@ -267,13 +279,14 @@ pub extern "system" fn send_surface(
     let surface = match env.new_global_ref(surface) {
         Ok(s) => s,
         Err(e) => {
-            crate::error!("Error creating global ref: {e}");
+            log::error!("Error creating global ref: {e}");
             return;
         }
     };
     instance.signal_event(MediaPlayerEvent::SurfaceCreated(surface));
 }
 
+/// Signal to the decoder that the previous `android.view.Surface` has been destroyed.
 #[export_name = "Java_com_debug_myapplication_NativeLibSingleton_destroySurface"]
 pub extern "system" fn destroy_surface(
     _env: JNIEnv,
@@ -285,6 +298,7 @@ pub extern "system" fn destroy_surface(
     instance.signal_event(MediaPlayerEvent::SurfaceDestroyed);
 }
 
+/// Start the WebRTC decoder.
 #[export_name = "Java_com_debug_myapplication_NativeLibSingleton_startMediaPlayer"]
 pub extern "system" fn start_media_player(
     _env: JNIEnv,
@@ -293,7 +307,7 @@ pub extern "system" fn start_media_player(
 ) {
     debug_assert_ne!(ptr, 0);
 
-    crate::info!("starting");
+    log::info!("starting");
 
     let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
     arc.spawn(webrtc::start_webrtc);

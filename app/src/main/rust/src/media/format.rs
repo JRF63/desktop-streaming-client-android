@@ -1,7 +1,4 @@
-mod video;
-
-pub use self::video::{H264Csd, HevcCsd, VideoType};
-use super::status::MediaStatus;
+use super::{MediaStatus, MimeType};
 use ndk_sys::{
     AMediaFormat, AMediaFormat_delete, AMediaFormat_new, AMediaFormat_setBuffer,
     AMediaFormat_setInt32, AMediaFormat_setString, AMEDIAFORMAT_KEY_HEIGHT,
@@ -18,10 +15,6 @@ use std::{
 const MEDIAFORMAT_KEY_CSD_0: &'static str = "csd-0\0";
 const MEDIAFORMAT_KEY_CSD_1: &'static str = "csd-1\0";
 const MEDIAFORMAT_KEY_LOW_LATENCY: &'static str = "low-latency\0";
-
-const AV1_MIME_TYPE: &'static str = "video/av01\0";
-const HEVC_MIME_TYPE: &'static str = "video/hevc\0";
-const H264_MIME_TYPE: &'static str = "video/avc\0";
 
 /// RAII wrapper for [AMediaFormat].
 #[repr(transparent)]
@@ -54,15 +47,12 @@ impl MediaFormat {
     }
 
     /// Sets the mime type.
-    pub fn set_mime_type<T>(&mut self, mime_type: T)
-    where
-        T: MediaFormatMimeType,
-    {
+    pub fn set_mime_type(&mut self, mime_type: MimeType) {
         unsafe {
             AMediaFormat_setString(
                 self.as_inner(),
                 AMEDIAFORMAT_KEY_MIME,
-                mime_type.mime_type().as_ptr(),
+                mime_type.to_android_cstr().as_ptr().cast(),
             );
         }
     }
@@ -131,19 +121,4 @@ pub trait MediaFormatMimeType {
 pub trait MediaFormatData {
     /// Include the data in the format.
     fn add_to_media_format(&self, media_format: &mut MediaFormat);
-}
-
-impl MediaFormatMimeType for &str {
-    fn mime_type(&self) -> &CStr {
-        let s = match *self {
-            "video/AV1" => AV1_MIME_TYPE,
-            "video/H265" => HEVC_MIME_TYPE,
-            "video/H264" => H264_MIME_TYPE,
-            _ => {
-                crate::error!("Unsupported MIME type");
-                "\0"
-            }
-        };
-        unsafe { CStr::from_ptr(s.as_ptr().cast()) }
-    }
 }

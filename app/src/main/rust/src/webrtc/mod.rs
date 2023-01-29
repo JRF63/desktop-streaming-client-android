@@ -11,16 +11,10 @@ pub async fn start_webrtc(singleton: Arc<NativeLibSingleton>) {
     // TODO: Get from mDNS or something
     let addr = ([192, 168, 1, 253], 9090);
 
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_min_level(log::Level::Info)
-            .with_tag("client-android"),
-    );
-
     let signaler = match signaling::WebSocketSignaler::new(addr).await {
         Ok(s) => s,
         Err(e) => {
-            crate::error!("Creation of WebSocket signaling channel failed: {e:?}");
+            log::error!("Creation of WebSocket signaling channel failed: {e:?}");
             return;
         }
     };
@@ -28,7 +22,7 @@ pub async fn start_webrtc(singleton: Arc<NativeLibSingleton>) {
     let decoder_builder = match decoder::AndroidDecoderBuilder::new(singleton) {
         Ok(b) => b,
         Err(e) => {
-            crate::error!("Failed to initialize an Android decoder: {e:?}");
+            log::error!("Failed to initialize an Android decoder: {e:?}");
             return;
         }
     };
@@ -39,7 +33,7 @@ pub async fn start_webrtc(singleton: Arc<NativeLibSingleton>) {
         .with_data_channel_handler(Box::new(controls_handler));
 
     let Ok(peer) = peer_builder.build().await else {
-        crate::error!("Failed to initialize a WebRTC connection");
+        log::error!("Failed to initialize a WebRTC connection");
         return;
     };
     peer.is_closed().await;
