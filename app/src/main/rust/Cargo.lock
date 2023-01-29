@@ -2147,6 +2147,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "log",
  "serde",
  "tokio",
  "webrtc",

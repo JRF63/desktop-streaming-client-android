@@ -18,7 +18,7 @@ class MediaPlayerActivity : AppCompatActivity() {
         setContentView(binding.root)
         layoutConstraints.clone(binding.root)
 
-        NativeLibSingleton.mediaPlayerCreated(this)
+        binding.surfaceView.keepScreenOn = true;
 
         binding.surfaceView.holder.addCallback(object: SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -31,6 +31,8 @@ class MediaPlayerActivity : AppCompatActivity() {
                 NativeLibSingleton.mediaPlayerSurfaceDestroyed()
             }
         })
+
+        NativeLibSingleton.mediaPlayerCreated(this)
     }
 
     override fun onDestroy() {

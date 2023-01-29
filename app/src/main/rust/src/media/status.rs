@@ -114,7 +114,7 @@ impl TryFrom<media_status_t> for NonZeroSysMediaStatus {
             media_status_t::AMEDIA_IMGREADER_CANNOT_LOCK_IMAGE => Ok(NonZeroSysMediaStatus::AMEDIA_IMGREADER_CANNOT_LOCK_IMAGE),
             media_status_t::AMEDIA_IMGREADER_CANNOT_UNLOCK_IMAGE => Ok(NonZeroSysMediaStatus::AMEDIA_IMGREADER_CANNOT_UNLOCK_IMAGE),
             media_status_t::AMEDIA_IMGREADER_IMAGE_NOT_LOCKED => Ok(NonZeroSysMediaStatus::AMEDIA_IMGREADER_IMAGE_NOT_LOCKED),
-            _ => unreachable!("Unhandled `media_status_t` value"),
+            _ => Ok(NonZeroSysMediaStatus::AMEDIA_ERROR_UNKNOWN),
         }
     }
 }

@@ -136,10 +136,13 @@ pub trait MediaFormatData {
 impl MediaFormatMimeType for &str {
     fn mime_type(&self) -> &CStr {
         let s = match *self {
-            "video/av01" => H264_MIME_TYPE,
-            "video/hevc" => HEVC_MIME_TYPE,
-            "video/avc" => H264_MIME_TYPE,
-            _ => panic!("Unsupported MIME type"),
+            "video/AV1" => AV1_MIME_TYPE,
+            "video/H265" => HEVC_MIME_TYPE,
+            "video/H264" => H264_MIME_TYPE,
+            _ => {
+                crate::error!("Unsupported MIME type");
+                "\0"
+            }
         };
         unsafe { CStr::from_ptr(s.as_ptr().cast()) }
     }

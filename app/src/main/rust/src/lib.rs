@@ -1,4 +1,4 @@
-// mod debug;
+mod debug;
 mod log;
 mod media;
 mod util;
@@ -13,14 +13,16 @@ use jni::{
     objects::{GlobalRef, JObject, JString, JValue, ReleaseMode},
     JNIEnv, JavaVM,
 };
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 use tokio::{
     runtime::{self, Runtime},
-    sync::broadcast,
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
 };
 
 pub const RUNTIME_WORKER_THREADS: usize = 2;
-pub const BROADCAST_CHANNEL_CAPACITY: usize = 4;
 
 /// Events that are of interest to the media player.
 #[derive(Clone)]
@@ -45,7 +47,8 @@ pub struct NativeLibSingleton {
     vm: JavaVM,
     singleton: GlobalRef,
     runtime: Runtime,
-    sender: broadcast::Sender<MediaPlayerEvent>,
+    sender: UnboundedSender<MediaPlayerEvent>,
+    receiver: Mutex<Option<UnboundedReceiver<MediaPlayerEvent>>>,
 }
 
 impl NativeLibSingleton {
@@ -55,13 +58,14 @@ impl NativeLibSingleton {
             .enable_all()
             .worker_threads(RUNTIME_WORKER_THREADS)
             .build()?;
-        let (sender, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let (sender, receiver) = unbounded_channel();
 
         Ok(NativeLibSingleton {
             vm,
             singleton,
             runtime,
             sender,
+            receiver: Mutex::new(Some(receiver)),
         })
     }
 
@@ -103,8 +107,9 @@ impl NativeLibSingleton {
         self.runtime.spawn(func(self.clone()));
     }
 
-    pub fn get_event_receiver(&self) -> broadcast::Receiver<MediaPlayerEvent> {
-        self.sender.subscribe()
+    pub fn get_event_receiver(&self) -> Option<UnboundedReceiver<MediaPlayerEvent>> {
+        let mut lock_guard = self.receiver.lock().ok()?;
+        lock_guard.take()
     }
 
     pub fn get_api_level(&self, env: &JNIEnv) -> Result<i32, jni::errors::Error> {
