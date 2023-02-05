@@ -16,7 +16,7 @@ use std::{
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
 use webrtc::{
     peer_connection::peer_connection_state::RTCPeerConnectionState, rtcp,
-    rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication, rtp,
+    rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication,
     rtp_transceiver::rtp_receiver::RTCRtpReceiver, track::track_remote::TrackRemote,
 };
 use webrtc_helper::{
@@ -26,8 +26,8 @@ use webrtc_helper::{
     WebRtcPeer,
 };
 
-const RTP_PACKET_MAX_SIZE: usize = 1500;
 const PLI_INTERVAL: Duration = Duration::from_millis(50);
+const NALU_MAX_SIZE: usize = 250_000;
 const NALU_TYPE_BITMASK: u8 = 0x1F;
 const NALU_TYPE_IDR_PIC: u8 = 5;
 
@@ -152,7 +152,7 @@ async fn start_decoder(
     let peer_clone = peer.clone();
     let decoder_clone = decoder.clone();
 
-    std::thread::spawn(move || {
+    let thread_handle = std::thread::spawn(move || {
         if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -279,6 +279,9 @@ async fn start_decoder(
     }
 
     exit.store(true, Ordering::Release);
+    if let Err(e) = thread_handle.join() {
+        log::error!("Error joining thread: {e:?}");
+    }
     return Err(DecoderError::ApplicationClosed);
 }
 
@@ -296,7 +299,6 @@ async fn create_decoder(
                 .enable_all()
                 .build()
                 .map_err(|_| DecoderError::TokioRuntimeCreationFailed)?;
-
             let local = tokio::task::LocalSet::new();
             let res =
                 local.block_on(&rt, async move {
@@ -312,7 +314,7 @@ async fn create_decoder(
                     let mut last_pli_time = SystemTime::UNIX_EPOCH;
 
                     let mut reorder_buffer = ReorderBuffer::new(track.clone());
-                    let mut payload_buf = vec![0u8; RTP_PACKET_MAX_SIZE];
+                    let mut payload_buf = vec![0u8; NALU_MAX_SIZE];
                     let mut reader = H264PayloadReader::new_reader(&mut payload_buf);
 
                     let mut native_window = None;

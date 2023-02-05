@@ -1,14 +1,11 @@
 use super::{MediaStatus, MimeType};
 use ndk_sys::{
-    AMediaFormat, AMediaFormat_delete, AMediaFormat_new, AMediaFormat_setBuffer,
-    AMediaFormat_setInt32, AMediaFormat_setString, AMEDIAFORMAT_KEY_HEIGHT,
-    AMEDIAFORMAT_KEY_MAX_HEIGHT, AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MIME,
-    AMEDIAFORMAT_KEY_PRIORITY, AMEDIAFORMAT_KEY_WIDTH,
+    AMediaFormat, AMediaFormat_delete, AMediaFormat_new, AMediaFormat_setInt32,
+    AMediaFormat_setString, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_MAX_HEIGHT,
+    AMEDIAFORMAT_KEY_MAX_WIDTH, AMEDIAFORMAT_KEY_MIME, AMEDIAFORMAT_KEY_PRIORITY,
+    AMEDIAFORMAT_KEY_WIDTH,
 };
-use std::{
-    ffi::{c_char, CStr},
-    ptr::NonNull,
-};
+use std::ptr::NonNull;
 
 // Only available starting API level 30
 const MEDIAFORMAT_KEY_LOW_LATENCY: &'static str = "low-latency\0";
@@ -97,11 +94,7 @@ impl MediaFormat {
 
         if let Ok(cstring) = CString::new(key) {
             unsafe {
-                AMediaFormat_setInt32(
-                    self.as_inner(),
-                    cstring.as_ptr().cast(),
-                    val,
-                );
+                AMediaFormat_setInt32(self.as_inner(), cstring.as_ptr().cast(), val);
             }
         }
     }
