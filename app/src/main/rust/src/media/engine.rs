@@ -23,8 +23,11 @@ use std::{
 #[repr(transparent)]
 pub struct MediaEngine(NonNull<AMediaCodec>);
 
-// FIXME: Is this safe?
+// SAFETY: `MediaEngine` is just a pointer. It should be safe to move to another thread.
 unsafe impl Send for MediaEngine {}
+
+// FIXME: Is this safe?
+unsafe impl Sync for MediaEngine {}
 
 impl Drop for MediaEngine {
     fn drop(&mut self) {

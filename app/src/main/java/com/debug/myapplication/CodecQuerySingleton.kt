@@ -64,12 +64,12 @@ object CodecQuerySingleton {
 
     private fun listDecodersForType(mimeType: String): List<MediaCodecInfo> {
         return MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.filter {
-                // Decoders only
-                !it.isEncoder
-            }.filter {
-                // Include only those that support `mimeType`
-                it.supportedTypes.any { type -> type.equals(mimeType, ignoreCase = true) }
-            }
+            // Decoders only
+            !it.isEncoder
+        }.filter {
+            // Include only those that support `mimeType`
+            it.supportedTypes.any { type -> type.equals(mimeType, ignoreCase = true) }
+        }
     }
 
     fun chooseDecoderForType(mimeType: String): String? {
@@ -104,17 +104,29 @@ object CodecQuerySingleton {
         }
 
         // Prefer decoders with low latency and is hardware accel., and sort by profile pref.
-        entries.sortWith(compareBy({ !it.isLowLatency },
-            { !it.isHardwareAccelerated },
-            { preference[it.profile] ?: Int.MAX_VALUE }))
+        entries.sortWith(
+            compareBy({ !it.isLowLatency },
+                { !it.isHardwareAccelerated },
+                { preference[it.profile] ?: Int.MAX_VALUE })
+        )
 
         return entries.firstOrNull()?.name
     }
 
     fun listProfilesForDecoder(decoderName: String, mimeType: String): List<Int>? {
+        val preference: MutableMap<Int, Int> = when (mimeType) {
+            "video/av01" -> av1ProfilePreference
+            "video/hevc" -> hevcProfilePreference
+            "video/avc" -> h264ProfilePreference
+            else -> null
+        } ?: return null
         return try {
             val decoder = MediaCodec.createByCodecName(decoderName)
-            decoder.codecInfo.getCapabilitiesForType(mimeType).profileLevels?.map { it.profile }
+            val profiles =
+                decoder.codecInfo.getCapabilitiesForType(mimeType).profileLevels?.map { it.profile }
+                    ?.toMutableList()
+            profiles?.sortWith(compareBy { preference[it] ?: Int.MAX_VALUE })
+            profiles
         } catch (e: java.lang.Exception) {
             null
         }

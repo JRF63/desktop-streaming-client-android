@@ -3,11 +3,14 @@ use crate::{
     window::NativeWindow,
     MediaPlayerEvent, NativeLibSingleton,
 };
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use std::{
     collections::HashMap,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
@@ -15,18 +18,18 @@ use webrtc::{
     peer_connection::peer_connection_state::RTCPeerConnectionState, rtcp,
     rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication, rtp,
     rtp_transceiver::rtp_receiver::RTCRtpReceiver, track::track_remote::TrackRemote,
-    util::marshal::Unmarshal,
 };
 use webrtc_helper::{
-    codecs::{Codec, CodecType, H264Codec, H264PayloadReader, H264PayloadReaderError, H264Profile},
+    codecs::{Codec, CodecType, H264Codec, H264PayloadReader, H264Profile},
     decoder::DecoderBuilder,
+    util::reorder_buffer::{PayloadReader, ReorderBuffer, ReorderBufferError},
     WebRtcPeer,
 };
 
 const RTP_PACKET_MAX_SIZE: usize = 1500;
-const READ_TIMEOUT_MILLIS: u64 = 5000;
-const RTCP_PLI_INTERVAL_MILLIS: u64 = 50;
+const PLI_INTERVAL: Duration = Duration::from_millis(50);
 const NALU_TYPE_BITMASK: u8 = 0x1F;
+const NALU_TYPE_IDR_PIC: u8 = 5;
 
 pub struct AndroidDecoderBuilder {
     singleton: Arc<NativeLibSingleton>,
@@ -69,12 +72,12 @@ enum DecoderError {
     RtcpSend(webrtc::Error),
     AttachThread(jni::errors::Error),
     SetAspectRatio(jni::errors::Error),
+    TokioRuntimeCreationFailed,
+    ThreadJoinFailed,
     UnknownMimeType,
     FailedToGetReceiver,
-    HeaderParsing,
     NativeWindowCreate,
     NoDecoderFound,
-    WebRtcDisconnected,
     ApplicationClosed,
 }
 
@@ -92,6 +95,21 @@ macro_rules! impl_from {
 impl_from!(MediaStatus, MediaEngine);
 impl_from!(webrtc::Error, RtcpSend);
 impl_from!(jni::errors::Error, AttachThread);
+
+async fn send_pli(
+    peer: &Arc<WebRtcPeer>,
+    last_pli_time: &mut SystemTime,
+    pli: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
+) -> Result<(), DecoderError> {
+    let now = SystemTime::now();
+    if let Ok(duration) = now.duration_since(*last_pli_time) {
+        if duration > PLI_INTERVAL {
+            peer.write_rtcp(&pli).await?;
+            *last_pli_time = now;
+        }
+    }
+    Ok(())
+}
 
 async fn start_decoder(
     track: Arc<TrackRemote>,
@@ -113,60 +131,127 @@ async fn start_decoder(
         .get(&mime_type)
         .ok_or(DecoderError::NoDecoderFound)?;
 
-    let mut buf = vec![0u8; RTP_PACKET_MAX_SIZE];
     let mut receiver = singleton
         .get_event_receiver()
         .ok_or(DecoderError::FailedToGetReceiver)?;
 
-    let decoder = create_decoder(
-        &singleton,
-        &track,
-        &peer,
-        mime_type,
-        decoder_name,
-        &mut receiver,
-        &mut buf,
-    )
-    .await?;
+    let decoder = Arc::new(
+        create_decoder(
+            &singleton,
+            &track,
+            &peer,
+            mime_type,
+            decoder_name,
+            &mut receiver,
+        )
+        .await?,
+    );
 
-    let pli = PictureLossIndication {
-        sender_ssrc: 0,
-        media_ssrc: track.ssrc(),
-    };
-    let pli = [Box::new(pli) as Box<(dyn rtcp::packet::Packet + Send + Sync + 'static)>];
-    let mut last_pli_time = SystemTime::UNIX_EPOCH;
+    let exit = Arc::new(AtomicBool::new(false));
+    let exit_clone = exit.clone();
+    let peer_clone = peer.clone();
+    let decoder_clone = decoder.clone();
 
-    async fn send_pli(
-        peer: &Arc<WebRtcPeer>,
-        last_pli_time: &mut SystemTime,
-        pli: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
-    ) -> Result<(), DecoderError> {
-        const PLI_INTERVAL: Duration = Duration::from_millis(RTCP_PLI_INTERVAL_MILLIS);
-        let now = SystemTime::now();
-        if let Ok(duration) = now.duration_since(*last_pli_time) {
-            if duration > PLI_INTERVAL {
-                peer.write_rtcp(&pli).await?;
-                *last_pli_time = now;
+    std::thread::spawn(move || {
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            let local = tokio::task::LocalSet::new();
+
+            // TODO: Try unconstrained task here?
+            let res =
+                local.block_on(&rt, async move {
+                    let peer = peer_clone;
+                    let decoder = decoder_clone;
+                    let exit = exit_clone;
+
+                    let pli = PictureLossIndication {
+                        sender_ssrc: 0,
+                        media_ssrc: track.ssrc(),
+                    };
+                    let pli =
+                        [Box::new(pli)
+                            as Box<
+                                (dyn rtcp::packet::Packet + Send + Sync + 'static),
+                            >];
+                    let mut last_pli_time = SystemTime::UNIX_EPOCH;
+
+                    let mut has_reference_frame = false;
+                    let mut reorder_buffer = ReorderBuffer::new(track);
+                    let mut input_buffer = decoder.dequeue_input_buffer(MediaTimeout::INFINITE)?;
+                    let mut reader = H264PayloadReader::new_reader(&mut input_buffer);
+
+                    while !exit.load(Ordering::Acquire) {
+                        match reorder_buffer.read_from_track(&mut reader).await {
+                            Ok(n) => {
+                                std::mem::drop(reader);
+
+                                if !has_reference_frame {
+                                    let nalu_type = input_buffer[4] & NALU_TYPE_BITMASK;
+                                    if nalu_type != NALU_TYPE_IDR_PIC {
+                                        send_pli(&peer, &mut last_pli_time, &pli).await?;
+                                        reader = H264PayloadReader::new_reader(&mut input_buffer);
+                                        continue;
+                                    } else {
+                                        has_reference_frame = true;
+                                    }
+                                }
+
+                                let res = decoder.queue_input_buffer(input_buffer, n as _, 0, 0);
+                                input_buffer =
+                                    decoder.dequeue_input_buffer(MediaTimeout::INFINITE)?;
+                                reader = H264PayloadReader::new_reader(&mut input_buffer);
+                                match res {
+                                    Ok(_) => (), // TODO: Use a channel to signal the other thread?
+                                    Err(e) => log::error!("queue_input_buffer error: {e}"),
+                                }
+                            }
+                            Err(e) => {
+                                match e {
+                                    ReorderBufferError::HeaderParsingError
+                                    | ReorderBufferError::TrackRemoteReadError
+                                    | ReorderBufferError::PayloadReaderError => {
+                                        has_reference_frame = false;
+                                        reader.reset();
+                                        send_pli(&peer, &mut &mut last_pli_time, &pli).await?;
+                                    }
+                                    ReorderBufferError::PayloadTooShort => (), // Empty payload?
+                                    ReorderBufferError::BufferFull => {
+                                        // TODO: Should be NACK
+                                        has_reference_frame = false;
+                                        reader.reset();
+                                        send_pli(&peer, &mut &mut last_pli_time, &pli).await?;
+                                    }
+                                    _ => (),
+                                    // ReorderBufferError::TrackRemoteReadTimeout => todo!(),
+                                    // ReorderBufferError::NoMoreSavedPackets => todo!(),
+                                    // ReorderBufferError::UnableToMaintainReorderBuffer => todo!(), // TODO: RENAME THIS
+                                    // ReorderBufferError::UninitializedSequenceNumber => todo!(),
+                                }
+                            }
+                        }
+                    }
+
+                    Result::<(), DecoderError>::Ok(())
+                });
+            if let Err(e) = res {
+                log::error!("{e:?}");
             }
         }
-        Ok(())
-    }
+    });
 
-    let mut input_buffer = decoder.dequeue_input_buffer(MediaTimeout::INFINITE)?;
-    let mut has_reference_frame = false;
     let mut render = true;
-    let mut reader = H264PayloadReader::new(&mut input_buffer);
-    let mut last_sequence_number = None;
 
     loop {
         if peer.connection_state() != RTCPeerConnectionState::Connected {
-            return Err(DecoderError::WebRtcDisconnected);
+            break;
         }
 
         match receiver.try_recv() {
             Ok(msg) => match msg {
                 MediaPlayerEvent::MainActivityDestroyed => {
-                    return Err(DecoderError::ApplicationClosed);
+                    break;
                 }
                 MediaPlayerEvent::SurfaceCreated(surface) => {
                     let env = singleton.vm.attach_current_thread()?;
@@ -183,102 +268,18 @@ async fn start_decoder(
                 }
             },
             Err(TryRecvError::Disconnected) => {
-                return Err(DecoderError::ApplicationClosed);
+                break;
             }
             Err(TryRecvError::Empty) => {
-                match tokio::time::timeout(
-                    Duration::from_millis(READ_TIMEOUT_MILLIS),
-                    track.read(&mut buf),
-                )
-                .await
-                {
-                    Err(_) => {
-                        log::error!("Timed-out while reading from `TrackRemote`");
-                        continue;
-                    }
-                    Ok(read_result) => match read_result {
-                        Err(_) => {
-                            send_pli(&peer, &mut last_pli_time, &pli).await?;
-                            reader = H264PayloadReader::new(&mut input_buffer);
-                        }
-                        Ok((n, _)) => {
-                            let mut b = &buf[..n];
-
-                            // Unmarshaling the header would move `b` to point to the payload
-                            let Some(header) = unmarshal_header(&mut b) else {
-                                return Err(DecoderError::HeaderParsing);
-                            };
-
-                            // Check sequence number for skipped values
-                            if let Some(last_sequence_number) = &mut last_sequence_number {
-                                if header.sequence_number.wrapping_sub(*last_sequence_number) != 1 {
-                                    has_reference_frame = false;
-                                    send_pli(&peer, &mut last_pli_time, &pli).await?;
-                                }
-                                *last_sequence_number = header.sequence_number;
-                            } else {
-                                last_sequence_number = Some(header.sequence_number);
-                            }
-
-                            match reader.read_payload(b) {
-                                Ok(num_bytes) => {
-                                    if !has_reference_frame {
-                                        let nalu_type = input_buffer[4] & NALU_TYPE_BITMASK;
-                                        if nalu_type != 5 {
-                                            send_pli(&peer, &mut last_pli_time, &pli).await?;
-                                            reader = H264PayloadReader::new(&mut input_buffer);
-                                            continue;
-                                        } else {
-                                            has_reference_frame = true;
-                                        }
-                                    }
-
-                                    match decoder.queue_input_buffer(
-                                        input_buffer,
-                                        num_bytes as _,
-                                        0,
-                                        0,
-                                    ) {
-                                        Ok(_) => {
-                                            match decoder.release_output_buffer(
-                                                MediaTimeout::INFINITE,
-                                                render,
-                                            ) {
-                                                Ok(_) => {
-                                                    input_buffer = decoder.dequeue_input_buffer(
-                                                        MediaTimeout::INFINITE,
-                                                    )?;
-                                                    reader =
-                                                        H264PayloadReader::new(&mut input_buffer);
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    log::error!("release_output_buffer error: {e}")
-                                                }
-                                            }
-                                        }
-                                        Err(e) => log::error!("queue_input_buffer error: {e}"),
-                                    }
-
-                                    has_reference_frame = false;
-                                    send_pli(&peer, &mut last_pli_time, &pli).await?;
-                                    input_buffer =
-                                        decoder.dequeue_input_buffer(MediaTimeout::INFINITE)?;
-                                    reader = H264PayloadReader::new(&mut input_buffer);
-                                }
-                                Err(H264PayloadReaderError::NeedMoreInput(r)) => reader = r,
-                                Err(_) => {
-                                    has_reference_frame = false;
-                                    send_pli(&peer, &mut last_pli_time, &pli).await?;
-                                    reader = H264PayloadReader::new(&mut input_buffer);
-                                }
-                            }
-                        }
-                    },
+                if let Err(e) = decoder.release_output_buffer(MediaTimeout::INFINITE, render) {
+                    log::error!("release_output_buffer error: {e}");
                 }
             }
         }
     }
+
+    exit.store(true, Ordering::Release);
+    return Err(DecoderError::ApplicationClosed);
 }
 
 async fn create_decoder(
@@ -288,157 +289,142 @@ async fn create_decoder(
     mime_type: MimeType,
     decoder_name: &str,
     receiver: &mut UnboundedReceiver<MediaPlayerEvent>,
-    buf: &mut [u8],
 ) -> Result<MediaEngine, DecoderError> {
-    let mut native_window = None;
-    let mut format = None;
-    let mut parameter_sets = None;
+    let thread_res = std::thread::scope(|s| {
+        let handle = s.spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| DecoderError::TokioRuntimeCreationFailed)?;
 
-    let mut payload_buf = vec![0u8; RTP_PACKET_MAX_SIZE];
-    let mut reader = H264PayloadReader::new(&mut payload_buf);
+            let local = tokio::task::LocalSet::new();
+            let res =
+                local.block_on(&rt, async move {
+                    let pli = PictureLossIndication {
+                        sender_ssrc: 0,
+                        media_ssrc: track.ssrc(),
+                    };
+                    let pli =
+                        [Box::new(pli)
+                            as Box<
+                                (dyn rtcp::packet::Packet + Send + Sync + 'static),
+                            >];
+                    let mut last_pli_time = SystemTime::UNIX_EPOCH;
 
-    let pli = PictureLossIndication {
-        sender_ssrc: 0,
-        media_ssrc: track.ssrc(),
-    };
-    let pli = [Box::new(pli) as Box<(dyn rtcp::packet::Packet + Send + Sync + 'static)>];
-    let mut last_pli_time = SystemTime::UNIX_EPOCH;
+                    let mut reorder_buffer = ReorderBuffer::new(track.clone());
+                    let mut payload_buf = vec![0u8; RTP_PACKET_MAX_SIZE];
+                    let mut reader = H264PayloadReader::new_reader(&mut payload_buf);
 
-    async fn send_pli(
-        peer: &Arc<WebRtcPeer>,
-        last_pli_time: &mut SystemTime,
-        pli: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
-    ) -> Result<(), DecoderError> {
-        const PLI_INTERVAL: Duration = Duration::from_millis(RTCP_PLI_INTERVAL_MILLIS);
-        let now = SystemTime::now();
-        if let Ok(duration) = now.duration_since(*last_pli_time) {
-            if duration > PLI_INTERVAL {
-                peer.write_rtcp(&pli).await?;
-                *last_pli_time = now;
-            }
-        }
-        Ok(())
-    }
+                    let mut native_window = None;
+                    let mut format = None;
+                    let mut parameter_sets = None;
 
-    loop {
-        if peer.connection_state() != RTCPeerConnectionState::Connected {
-            return Err(DecoderError::WebRtcDisconnected);
-        }
-
-        // If everything has been gathered, build the decoder
-        if native_window.is_some() && format.is_some() && parameter_sets.is_some() {
-            let mut decoder = MediaEngine::create_by_name(decoder_name)?;
-            decoder.initialize(&format.unwrap(), native_window, false)?;
-
-            let data: Bytes = parameter_sets.unwrap();
-            decoder.submit_codec_config(&data)?;
-            return Ok(decoder);
-        }
-
-        match receiver.try_recv() {
-            Ok(msg) => match msg {
-                MediaPlayerEvent::MainActivityDestroyed => {
-                    return Err(DecoderError::ApplicationClosed)
-                }
-                MediaPlayerEvent::SurfaceCreated(surface) => {
-                    let env = singleton.vm.attach_current_thread()?;
-                    native_window = Some(
-                        NativeWindow::new(&env, &surface.as_obj())
-                            .ok_or(DecoderError::NativeWindowCreate)?,
-                    );
-                }
-                MediaPlayerEvent::SurfaceDestroyed => {
-                    native_window = None;
-                }
-            },
-            Err(TryRecvError::Disconnected) => return Err(DecoderError::ApplicationClosed),
-            Err(TryRecvError::Empty) => {
-                match tokio::time::timeout(
-                    Duration::from_millis(READ_TIMEOUT_MILLIS),
-                    track.read(buf),
-                )
-                .await
-                {
-                    Err(_) => {
-                        log::info!("Timed-out while reading from `TrackRemote`");
-                        continue;
-                    }
-                    Ok(read_result) => match read_result {
-                        Err(_) => {
-                            send_pli(peer, &mut last_pli_time, &pli).await?;
-                            continue;
+                    loop {
+                        if peer.connection_state() != RTCPeerConnectionState::Connected {
+                            return Err(DecoderError::ApplicationClosed);
                         }
-                        Ok((n, _)) => {
-                            let mut b = &buf[..n];
 
-                            // Unmarshaling the header would move `b` to point to the payload
-                            let Some(_header) = unmarshal_header(&mut b) else {
-                                return Err(DecoderError::HeaderParsing);
-                            };
+                        // If everything has been gathered, build the decoder
+                        if native_window.is_some() && format.is_some() && parameter_sets.is_some() {
+                            let mut decoder = MediaEngine::create_by_name(decoder_name)?;
+                            decoder.initialize(&format.unwrap(), native_window, false)?;
 
-                            match reader.read_payload(b) {
-                                Ok(num_bytes) => {
-                                    if let Some((width, height)) =
-                                        H264Codec::get_resolution(&payload_buf[..num_bytes])
-                                    {
-                                        let width = width as i32;
-                                        let height = height as i32;
-                                        let env = singleton.vm.attach_current_thread()?;
-                                        singleton
-                                            .set_media_player_aspect_ratio(&env, width, height)
-                                            .map_err(|e| DecoderError::SetAspectRatio(e))?;
-                                        format = Some(MediaFormat::new()?);
-                                        if let Some(format) = &mut format {
-                                            format.set_mime_type(mime_type);
-                                            format.set_realtime_priority(true);
-                                            format.set_resolution(width, height);
-                                            format.set_max_resolution(width, height);
-                                            if singleton.get_api_level(&env)? >= 30 {
-                                                format.set_low_latency(true);
+                            let data: Bytes = parameter_sets.unwrap();
+                            decoder.submit_codec_config(&data)?;
+                            return Ok(decoder);
+                        }
+
+                        match receiver.try_recv() {
+                            Ok(msg) => match msg {
+                                MediaPlayerEvent::MainActivityDestroyed => {
+                                    return Err(DecoderError::ApplicationClosed)
+                                }
+                                MediaPlayerEvent::SurfaceCreated(surface) => {
+                                    let env = singleton.vm.attach_current_thread()?;
+                                    native_window = Some(
+                                        NativeWindow::new(&env, &surface.as_obj())
+                                            .ok_or(DecoderError::NativeWindowCreate)?,
+                                    );
+                                }
+                                MediaPlayerEvent::SurfaceDestroyed => {
+                                    native_window = None;
+                                }
+                            },
+                            Err(TryRecvError::Disconnected) => {
+                                return Err(DecoderError::ApplicationClosed)
+                            }
+                            Err(TryRecvError::Empty) => {
+                                match reorder_buffer.read_from_track(&mut reader).await {
+                                    Ok(n) => {
+                                        std::mem::drop(reader);
+
+                                        let payload = &payload_buf[..n];
+
+                                        if let Some((width, height)) =
+                                            H264Codec::get_resolution(payload)
+                                        {
+                                            let width = width as i32;
+                                            let height = height as i32;
+                                            let env = singleton.vm.attach_current_thread()?;
+                                            singleton
+                                                .set_media_player_aspect_ratio(&env, width, height)
+                                                .map_err(|e| DecoderError::SetAspectRatio(e))?;
+                                            format = Some(MediaFormat::new()?);
+                                            if let Some(format) = &mut format {
+                                                format.set_mime_type(mime_type);
+                                                format.set_realtime_priority(true);
+                                                format.set_resolution(width, height);
+                                                format.set_max_resolution(width, height);
+                                                if singleton.get_api_level(&env)? >= 30 {
+                                                    format.set_low_latency(true);
+                                                }
+                                                format.set_integer(
+                                                    "vendor.rtc-ext-dec-low-latency.enable",
+                                                    1,
+                                                );
                                             }
+                                            parameter_sets = Some(Bytes::copy_from_slice(payload));
+                                        } else {
+                                            send_pli(peer, &mut last_pli_time, &pli).await?;
                                         }
-                                        parameter_sets =
-                                            Some(Bytes::copy_from_slice(&payload_buf[..num_bytes]));
-                                    } else {
-                                        send_pli(peer, &mut last_pli_time, &pli).await?;
+
+                                        reader = H264PayloadReader::new_reader(&mut payload_buf);
                                     }
-                                    reader = H264PayloadReader::new(&mut payload_buf);
-                                }
-                                Err(H264PayloadReaderError::NeedMoreInput(_)) => {
-                                    send_pli(peer, &mut last_pli_time, &pli).await?;
-                                    reader = H264PayloadReader::new(&mut payload_buf);
-                                }
-                                Err(_) => {
-                                    send_pli(peer, &mut last_pli_time, &pli).await?;
-                                    reader = H264PayloadReader::new(&mut payload_buf);
+                                    Err(e) => {
+                                        match e {
+                                            ReorderBufferError::HeaderParsingError
+                                            | ReorderBufferError::TrackRemoteReadError
+                                            | ReorderBufferError::PayloadReaderError => {
+                                                reader.reset();
+                                                send_pli(&peer, &mut &mut last_pli_time, &pli)
+                                                    .await?;
+                                            }
+                                            ReorderBufferError::PayloadTooShort => (), // Empty payload?
+                                            ReorderBufferError::BufferFull => {
+                                                // TODO: Should be NACK
+                                                reader.reset();
+                                                send_pli(&peer, &mut &mut last_pli_time, &pli)
+                                                    .await?;
+                                            }
+                                            _ => (),
+                                            // ReorderBufferError::TrackRemoteReadTimeout => todo!(),
+                                            // ReorderBufferError::NoMoreSavedPackets => todo!(),
+                                            // ReorderBufferError::UnableToMaintainReorderBuffer => todo!(), // TODO: RENAME THIS
+                                            // ReorderBufferError::UninitializedSequenceNumber => todo!(),
+                                        }
+                                    }
                                 }
                             }
                         }
-                    },
-                }
-            }
-        }
-    }
-}
+                    }
+                });
 
-fn unmarshal_header(buffer: &mut &[u8]) -> Option<rtp::header::Header> {
-    let header = rtp::header::Header::unmarshal(buffer).ok()?;
-    if header.padding {
-        let payload_len = buffer.remaining();
-        if payload_len > 0 {
-            let padding_len = buffer[payload_len - 1] as usize;
-            if padding_len <= payload_len {
-                *buffer = &buffer[..payload_len - padding_len];
-                Some(header)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        Some(header)
-    }
+            res
+        });
+        handle.join()
+    });
+    
+    thread_res.map_err(|_| DecoderError::ThreadJoinFailed)?
 }
 
 impl AndroidDecoderBuilder {

@@ -10,10 +10,7 @@ use std::{
     ptr::NonNull,
 };
 
-// Need to put the strings here because `AMEDIAFORMAT_KEY_CSD_0` and `AMEDIAFORMAT_KEY_CSD_1`
-// only became available in API level 28.
-const MEDIAFORMAT_KEY_CSD_0: &'static str = "csd-0\0";
-const MEDIAFORMAT_KEY_CSD_1: &'static str = "csd-1\0";
+// Only available starting API level 30
 const MEDIAFORMAT_KEY_LOW_LATENCY: &'static str = "low-latency\0";
 
 /// RAII wrapper for [AMediaFormat].
@@ -95,30 +92,17 @@ impl MediaFormat {
         }
     }
 
-    /// Helper function for adding data to the `MediaFormat` from a slice.
-    pub fn set_buffer(&mut self, name: *const c_char, data: &[u8]) {
-        unsafe {
-            AMediaFormat_setBuffer(self.as_inner(), name, data.as_ptr().cast(), data.len() as _)
+    pub fn set_integer(&mut self, key: &str, val: i32) {
+        use std::ffi::CString;
+
+        if let Ok(cstring) = CString::new(key) {
+            unsafe {
+                AMediaFormat_setInt32(
+                    self.as_inner(),
+                    cstring.as_ptr().cast(),
+                    val,
+                );
+            }
         }
     }
-
-    /// Add extra data to the `MediaFormat`.
-    pub fn add_data<T>(&mut self, data: T)
-    where
-        T: MediaFormatData,
-    {
-        data.add_to_media_format(self);
-    }
-}
-
-/// Trait encapsulating types that have a MIME type.
-pub trait MediaFormatMimeType {
-    // MIME type as a C string.
-    fn mime_type(&self) -> &CStr;
-}
-
-/// Data that can be added to `MediaFormat`.
-pub trait MediaFormatData {
-    /// Include the data in the format.
-    fn add_to_media_format(&self, media_format: &mut MediaFormat);
 }
