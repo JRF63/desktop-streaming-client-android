@@ -352,7 +352,6 @@ version = "0.1.0"
 dependencies = [
  "android_logger",
  "async-trait",
- "bytes",
  "futures-util",
  "jni",
  "log",
@@ -667,6 +666,12 @@ dependencies = [
  "log",
  "regex",
 ]
+
+[[package]]
+name = "exp-golomb"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8150b1c064c6d23fef1c0ab16c2a3d4564483e468debec91a1b1b1ade7a8b06"
 
 [[package]]
 name = "ff"
@@ -2143,10 +2148,12 @@ dependencies = [
 [[package]]
 name = "webrtc-helper"
 version = "0.1.0"
+source = "git+https://github.com/JRF63/webrtc-helper.git?rev=8a2ce55#8a2ce55df118cee2e8f36ff32c6565dccc68de19"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "exp-golomb",
  "log",
  "serde",
  "tokio",

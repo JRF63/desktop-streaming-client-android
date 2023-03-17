@@ -23,6 +23,7 @@ use tokio::{
 };
 
 pub const RUNTIME_WORKER_THREADS: usize = 2;
+const LOG_TAG: &str = "client-android";
 
 /// Events that are of interest to the media player.
 #[derive(Clone)]
@@ -49,6 +50,7 @@ impl std::fmt::Debug for MediaPlayerEvent {
 pub struct NativeLibSingleton {
     vm: JavaVM,
     singleton: GlobalRef,
+    api_level: i32,
     runtime: Runtime,
     sender: UnboundedSender<MediaPlayerEvent>,
     receiver: Mutex<Option<UnboundedReceiver<MediaPlayerEvent>>>,
@@ -56,7 +58,11 @@ pub struct NativeLibSingleton {
 
 impl NativeLibSingleton {
     /// Create a `NativeLibManager`.
-    pub fn new(vm: JavaVM, singleton: GlobalRef) -> Result<NativeLibSingleton, std::io::Error> {
+    pub fn new(
+        vm: JavaVM,
+        singleton: GlobalRef,
+        api_level: i32,
+    ) -> Result<NativeLibSingleton, std::io::Error> {
         let runtime = runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(RUNTIME_WORKER_THREADS)
@@ -66,6 +72,7 @@ impl NativeLibSingleton {
         Ok(NativeLibSingleton {
             vm,
             singleton,
+            api_level,
             runtime,
             sender,
             receiver: Mutex::new(Some(receiver)),
@@ -101,6 +108,11 @@ impl NativeLibSingleton {
         &self.vm
     }
 
+    /// Returns the API level of the device that this is currently running on.
+    pub fn api_level(&self) -> i32 {
+        self.api_level
+    }
+
     /// Spawn an async function on the runtime.
     pub fn spawn<T, F>(self: &Arc<NativeLibSingleton>, func: T)
     where
@@ -115,16 +127,6 @@ impl NativeLibSingleton {
     pub fn get_event_receiver(&self) -> Option<UnboundedReceiver<MediaPlayerEvent>> {
         let mut lock_guard = self.receiver.lock().ok()?;
         lock_guard.take()
-    }
-
-    /// Returns the API level of the device that this is currently running on.
-    pub fn get_api_level(&self, env: &JNIEnv) -> Result<i32, jni::errors::Error> {
-        let method_output = env.call_method(self.singleton.as_obj(), "getApiLevel", "()I", &[])?;
-
-        match method_output {
-            JValue::Int(level) => Ok(level),
-            _ => Err(jni::errors::Error::JavaException),
-        }
     }
 
     /// Call the singleton method to set the aspect ratio of the player.
@@ -162,7 +164,7 @@ impl NativeLibSingleton {
             "(Ljava/lang/String;)Ljava/lang/String;",
             &[mime_type.into()],
         )?;
-        
+
         let obj = method_output.l()?;
         if obj.into_raw().is_null() {
             return Ok(None);
@@ -215,6 +217,13 @@ pub extern "system" fn create_native_instance(
     env: JNIEnv,
     singleton: jni::sys::jobject,
 ) -> jni::sys::jlong {
+    // Logger needs to be the first thing initialized
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_min_level(log::Level::Info)
+            .with_tag(LOG_TAG),
+    );
+
     let vm = match env.get_java_vm() {
         Ok(vm) => vm,
         Err(e) => {
@@ -223,9 +232,8 @@ pub extern "system" fn create_native_instance(
         }
     };
 
-    debug_assert!(!singleton.is_null());
-    let singleton = unsafe { JObject::from_raw(singleton) };
-    let singleton = match env.new_global_ref(singleton) {
+    // `singleton` should never be a null pointer
+    let singleton = match env.new_global_ref(unsafe { JObject::from_raw(singleton) }) {
         Ok(s) => s,
         Err(e) => {
             log::error!("{e}");
@@ -233,15 +241,20 @@ pub extern "system" fn create_native_instance(
         }
     };
 
-    match NativeLibSingleton::new(vm, singleton) {
-        Ok(instance) => {
-            android_logger::init_once(
-                android_logger::Config::default()
-                    .with_min_level(log::Level::Info)
-                    .with_tag("client-android"),
-            );
-            Arc::new(instance).into_java_long()
+    let api_level = match env.call_method(&singleton, "getApiLevel", "()I", &[]) {
+        Ok(JValue::Int(api_level)) => api_level,
+        Ok(_) => {
+            log::error!("`getApiLevel` did not return an `Int`");
+            return 0;
         }
+        Err(e) => {
+            log::error!("{e}");
+            return 0;
+        }
+    };
+
+    match NativeLibSingleton::new(vm, singleton, api_level) {
+        Ok(instance) => Arc::new(instance).into_java_long(),
         Err(e) => {
             log::error!("Error creating native instance: {e}");
             0
@@ -271,19 +284,24 @@ pub extern "system" fn send_surface(
     ptr: jni::sys::jlong,
     surface: jni::sys::jobject,
 ) {
-    debug_assert_ne!(ptr, 0);
-    let instance = unsafe { NativeLibSingleton::as_ref(ptr) };
+    if ptr != 0 {
+        let instance = unsafe { NativeLibSingleton::as_ref(ptr) };
 
-    debug_assert!(!surface.is_null());
-    let surface = unsafe { JObject::from_raw(surface) };
-    let surface = match env.new_global_ref(surface) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("Error creating global ref: {e}");
+        if surface.is_null() {
+            log::error!("Null `Surface` object passed to `send_surface`");
             return;
         }
-    };
-    instance.signal_event(MediaPlayerEvent::SurfaceCreated(surface));
+
+        let surface = unsafe { JObject::from_raw(surface) };
+        let surface = match env.new_global_ref(surface) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Error creating global ref: {e}");
+                return;
+            }
+        };
+        instance.signal_event(MediaPlayerEvent::SurfaceCreated(surface));
+    }
 }
 
 /// Signal to the decoder that the previous `android.view.Surface` has been destroyed.
@@ -293,9 +311,10 @@ pub extern "system" fn destroy_surface(
     _singleton: jni::sys::jobject,
     ptr: jni::sys::jlong,
 ) {
-    debug_assert_ne!(ptr, 0);
-    let instance = unsafe { NativeLibSingleton::as_ref(ptr) };
-    instance.signal_event(MediaPlayerEvent::SurfaceDestroyed);
+    if ptr != 0 {
+        let instance = unsafe { NativeLibSingleton::as_ref(ptr) };
+        instance.signal_event(MediaPlayerEvent::SurfaceDestroyed);
+    }
 }
 
 /// Start the WebRTC decoder.
@@ -305,11 +324,11 @@ pub extern "system" fn start_media_player(
     _singleton: jni::sys::jobject,
     ptr: jni::sys::jlong,
 ) {
-    debug_assert_ne!(ptr, 0);
+    if ptr != 0 {
+        log::info!("starting");
 
-    log::info!("starting");
-
-    let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
-    arc.spawn(webrtc::start_webrtc);
-    std::mem::forget(arc); // Prevent the `Arc` from being dropped
+        let arc = unsafe { NativeLibSingleton::from_raw_integer(ptr) };
+        arc.spawn(webrtc::start_webrtc);
+        std::mem::forget(arc); // Prevent the `Arc` from being dropped
+    }
 }

@@ -63,7 +63,7 @@ impl MediaEngine {
     pub fn initialize(
         &mut self,
         format: &MediaFormat,
-        window: Option<NativeWindow>,
+        window: Option<&NativeWindow>,
         is_encoder: bool,
     ) -> Result<(), MediaStatus> {
         let surface = if let Some(window) = window {
